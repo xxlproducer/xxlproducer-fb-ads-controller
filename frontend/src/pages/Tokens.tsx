@@ -53,7 +53,6 @@ export function Tokens() {
     queryKey: ["fb-accounts"],
     queryFn: async () =>
       (await api.get<{ count: number; accounts: AccountSummary[] }>("/fb-accounts/")).data,
-    enabled: (tokensQ.data?.length ?? 0) > 0,
   });
 
   const addMut = useMutation({
