@@ -158,6 +158,7 @@ async def _fetch_token_account(
     except FbApiError as e:
         return [], {
             "token_id": token.id,
+            "token_label": token.label or token.fb_user_name,
             "account_id": account_id,
             "error": str(e),
             "code": e.code,
@@ -204,18 +205,27 @@ async def _fetch_token_account(
     return rows, None
 
 
-async def _list_active_accounts(token: FbToken) -> list[str]:
+async def _list_active_accounts(token: FbToken) -> tuple[list[str], dict | None]:
+    """Return (account_ids, error). The error is surfaced to the dashboard
+    `errors[]` so users can see *why* a token contributes no rows.
+    """
     client = FbClient(token.access_token, proxy_url=token.proxy_url)
     try:
         accs = await client.ad_accounts()
-    except FbApiError:
-        return []
-    out = []
+    except FbApiError as e:
+        return [], {
+            "token_id": token.id,
+            "token_label": token.label or token.fb_user_name,
+            "account_id": None,
+            "error": str(e),
+            "code": e.code,
+        }
+    out: list[str] = []
     for a in accs:
         aid = a.get("account_id") or (a.get("id", "").removeprefix("act_"))
         if aid:
             out.append(aid)
-    return out
+    return out, None
 
 
 @router.post("/rows", response_model=DashboardResponse)
@@ -233,13 +243,19 @@ async def dashboard_rows(
     if not tokens:
         return DashboardResponse(count=0, rows=[], errors=[])
 
+    listing_errors: list[dict] = []
+
     # Resolve account list per token
     if request.account_ids:
         wanted = set(a.removeprefix("act_") for a in request.account_ids)
         per_token: list[tuple[FbToken, list[str]]] = [(t, list(wanted)) for t in tokens]
     else:
-        account_lists = await asyncio.gather(*(_list_active_accounts(t) for t in tokens))
-        per_token = list(zip(tokens, account_lists))
+        listings = await asyncio.gather(*(_list_active_accounts(t) for t in tokens))
+        per_token = []
+        for tok, (accs, err) in zip(tokens, listings):
+            per_token.append((tok, accs))
+            if err:
+                listing_errors.append(err)
 
     # Fan out
     tasks = []
@@ -248,11 +264,11 @@ async def dashboard_rows(
             tasks.append(_fetch_token_account(token, acc_id, request))
 
     if not tasks:
-        return DashboardResponse(count=0, rows=[], errors=[])
+        return DashboardResponse(count=0, rows=[], errors=listing_errors)
 
     results = await asyncio.gather(*tasks)
     rows: list[DashboardRow] = []
-    errors: list[dict] = []
+    errors: list[dict] = list(listing_errors)
     for r, e in results:
         rows.extend(r)
         if e:

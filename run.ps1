@@ -28,8 +28,8 @@ Write-Host ""
 $backendCmd = "Set-Location '$root\backend'; & '.\.venv\Scripts\python.exe' -m uvicorn app.main:app --host 127.0.0.1 --port 8080"
 $frontendCmd = "Set-Location '$root\frontend'; npm run dev"
 
-Start-Process powershell -ArgumentList "-NoExit", "-Command", $backendCmd
-Start-Process powershell -ArgumentList "-NoExit", "-Command", $frontendCmd
+Start-Process powershell -ArgumentList "-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $backendCmd
+Start-Process powershell -ArgumentList "-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $frontendCmd
 
 Start-Sleep -Seconds 5
 Start-Process "http://localhost:5173"

@@ -62,7 +62,13 @@ interface DashboardRow {
 interface DashboardResponse {
   count: number;
   rows: DashboardRow[];
-  errors: Array<{ token_id: number; account_id: string; error: string; code: number | null }>;
+  errors: Array<{
+    token_id: number;
+    token_label: string | null;
+    account_id: string | null;
+    error: string;
+    code: number | null;
+  }>;
 }
 
 const PRESETS: { id: DatePreset; label: string }[] = [
@@ -234,7 +240,7 @@ export function Dashboard() {
             <ul className="mt-2 space-y-1 text-xs text-amber-800 dark:text-amber-400">
               {errors.slice(0, 5).map((e, i) => (
                 <li key={i}>
-                  act_{e.account_id}: {e.error}
+                  {e.account_id ? `act_${e.account_id}` : (e.token_label || `token #${e.token_id}`)}: {e.error}
                 </li>
               ))}
               {errors.length > 5 && <li>+{errors.length - 5} more…</li>}
