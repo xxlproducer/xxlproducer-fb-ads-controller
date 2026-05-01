@@ -1,9 +1,10 @@
 import { Navigate, Route, Routes } from "react-router-dom";
-import { Layers, Rocket } from "lucide-react";
+import { Rocket } from "lucide-react";
 import { useAuth } from "@/lib/auth";
 import { Login } from "@/pages/Login";
 import { Tokens } from "@/pages/Tokens";
 import { Dashboard } from "@/pages/Dashboard";
+import { BulkActions } from "@/pages/BulkActions";
 import { Placeholder } from "@/pages/Placeholder";
 
 function FullScreenLoader() {
@@ -31,17 +32,7 @@ export default function App() {
     <Routes>
       <Route path="/" element={<Dashboard />} />
       <Route path="/tokens" element={<Tokens />} />
-      <Route
-        path="/bulk"
-        element={
-          <Placeholder
-            title="Bulk Actions"
-            description="Pause / activate / delete campaigns, adsets and ads in bulk"
-            icon={Layers}
-            body="Pick campaigns/adsets/ads from the grid and apply actions across many ad accounts at once."
-          />
-        }
-      />
+      <Route path="/bulk" element={<BulkActions />} />
       <Route
         path="/launch"
         element={
