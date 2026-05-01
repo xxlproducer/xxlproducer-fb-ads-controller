@@ -45,21 +45,6 @@ if not defined PY (
   exit /b 1
 )
 
-REM --- check Python version is in tested range (3.10 - 3.13) ---
-%PY% -c "import sys;v=sys.version_info;sys.exit(0 if (3,10)<=(v.major,v.minor)<=(3,13) else 2)" >nul 2>nul
-if errorlevel 2 (
-  echo.
-  echo [WARNING] Detected Python is outside the tested range 3.10-3.13.
-  echo Some packages may need to compile from source on newer Python.
-  echo.
-  echo Recommended: install Python 3.12 alongside your current Python from
-  echo   https://www.python.org/downloads/release/python-3128/
-  echo Then re-run setup.bat - it will pick 3.12 automatically.
-  echo.
-  set /p CONTINUE="Continue anyway? (y/N): "
-  if /i not "!CONTINUE!"=="y" exit /b 1
-)
-
 REM --- check node ---
 where node >nul 2>nul
 if errorlevel 1 (
