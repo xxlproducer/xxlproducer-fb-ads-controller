@@ -276,3 +276,16 @@ class FbClient:
             "limit": limit,
         }
         return await self._paginate(f"{acc}/ads", params)
+
+    # ----------------------------------------------------------- mutations
+
+    async def update_status(self, object_id: str, status: str) -> dict[str, Any]:
+        """POST /<object_id>?status=ACTIVE|PAUSED|ARCHIVED.
+
+        Works uniformly for campaigns, adsets, and ads.
+        """
+        return await self._request("POST", object_id, data={"status": status})
+
+    async def delete_object(self, object_id: str) -> dict[str, Any]:
+        """DELETE /<object_id>. Works for campaigns, adsets, and ads."""
+        return await self._request("DELETE", object_id)
