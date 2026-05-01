@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# DB / data
+*.db
+*.sqlite
+*.sqlite3
+data/
+uploads/
+
+# Node
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# tsc-emitted artifacts that should not be tracked
+frontend/vite.config.js
+frontend/vite.config.d.ts
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
