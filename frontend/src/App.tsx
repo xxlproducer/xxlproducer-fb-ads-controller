@@ -1,8 +1,9 @@
 import { Navigate, Route, Routes } from "react-router-dom";
-import { LayoutDashboard, Layers, Rocket } from "lucide-react";
+import { Layers, Rocket } from "lucide-react";
 import { useAuth } from "@/lib/auth";
 import { Login } from "@/pages/Login";
 import { Tokens } from "@/pages/Tokens";
+import { Dashboard } from "@/pages/Dashboard";
 import { Placeholder } from "@/pages/Placeholder";
 
 function FullScreenLoader() {
@@ -28,17 +29,7 @@ export default function App() {
 
   return (
     <Routes>
-      <Route
-        path="/"
-        element={
-          <Placeholder
-            title="Dashboard"
-            description="Aggregated stats across all your ad accounts"
-            icon={LayoutDashboard}
-            body="Will show impressions, clicks, spend, results, purchases — across all connected tokens. Coming next."
-          />
-        }
-      />
+      <Route path="/" element={<Dashboard />} />
       <Route path="/tokens" element={<Tokens />} />
       <Route
         path="/bulk"
