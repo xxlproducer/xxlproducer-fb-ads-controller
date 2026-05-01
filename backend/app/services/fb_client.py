@@ -11,6 +11,7 @@ control over batch / async-batch requests later.
 """
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -32,7 +33,11 @@ class FbApiError(Exception):
     subcode: int | None = None
     fbtrace_id: str | None = None
 
+    user_msg: str | None = None
+
     def __str__(self) -> str:  # noqa: D401
+        if self.user_msg:
+            return f"FB error {self.code}/{self.subcode}: {self.message} — {self.user_msg}"
         return f"FB error {self.code}/{self.subcode}: {self.message}"
 
 
@@ -96,6 +101,7 @@ class FbClient:
                 type=err.get("type"),
                 message=err.get("message", "unknown FB error"),
                 fbtrace_id=err.get("fbtrace_id"),
+                user_msg=err.get("error_user_msg"),
             )
         return payload
 
@@ -150,6 +156,7 @@ class FbClient:
                             subcode=err.get("error_subcode"),
                             type=err.get("type"),
                             message=err.get("message", "unknown FB error"),
+                            user_msg=err.get("error_user_msg"),
                             fbtrace_id=err.get("fbtrace_id"),
                         )
             else:
@@ -289,3 +296,88 @@ class FbClient:
     async def delete_object(self, object_id: str) -> dict[str, Any]:
         """DELETE /<object_id>. Works for campaigns, adsets, and ads."""
         return await self._request("DELETE", object_id)
+
+    # ----------------------------------------------------------- creation
+
+    async def create_campaign(
+        self,
+        account_id: str,
+        *,
+        name: str,
+        objective: str,
+        status: str = "PAUSED",
+        special_ad_categories: list[str] | None = None,
+        buying_type: str = "AUCTION",
+        daily_budget_cents: int | None = None,
+        lifetime_budget_cents: int | None = None,
+        bid_strategy: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /act_<id>/campaigns. Returns the new campaign id payload."""
+        acc = account_id if account_id.startswith("act_") else f"act_{account_id}"
+        # FB requires special_ad_categories as a JSON array string, even if empty.
+        cats = json.dumps(special_ad_categories or [])
+        data: dict[str, Any] = {
+            "name": name,
+            "objective": objective,
+            "status": status,
+            "special_ad_categories": cats,
+            "buying_type": buying_type,
+        }
+        if daily_budget_cents is not None:
+            data["daily_budget"] = daily_budget_cents
+        if lifetime_budget_cents is not None:
+            data["lifetime_budget"] = lifetime_budget_cents
+        if bid_strategy:
+            data["bid_strategy"] = bid_strategy
+        return await self._request("POST", f"{acc}/campaigns", data=data)
+
+    async def create_adset(
+        self,
+        account_id: str,
+        *,
+        name: str,
+        campaign_id: str,
+        optimization_goal: str,
+        billing_event: str = "IMPRESSIONS",
+        status: str = "PAUSED",
+        targeting: dict[str, Any] | None = None,
+        daily_budget_cents: int | None = None,
+        lifetime_budget_cents: int | None = None,
+        bid_amount_cents: int | None = None,
+        promoted_object: dict[str, Any] | None = None,
+        destination_type: str | None = None,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        dsa_beneficiary: str | None = None,
+        dsa_payor: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /act_<id>/adsets. Returns the new adset id payload."""
+        acc = account_id if account_id.startswith("act_") else f"act_{account_id}"
+        data: dict[str, Any] = {
+            "name": name,
+            "campaign_id": campaign_id,
+            "optimization_goal": optimization_goal,
+            "billing_event": billing_event,
+            "status": status,
+        }
+        if targeting is not None:
+            data["targeting"] = json.dumps(targeting)
+        if daily_budget_cents is not None:
+            data["daily_budget"] = daily_budget_cents
+        if lifetime_budget_cents is not None:
+            data["lifetime_budget"] = lifetime_budget_cents
+        if bid_amount_cents is not None:
+            data["bid_amount"] = bid_amount_cents
+        if promoted_object is not None:
+            data["promoted_object"] = json.dumps(promoted_object)
+        if destination_type:
+            data["destination_type"] = destination_type
+        if start_time:
+            data["start_time"] = start_time
+        if end_time:
+            data["end_time"] = end_time
+        if dsa_beneficiary:
+            data["dsa_beneficiary"] = dsa_beneficiary
+        if dsa_payor:
+            data["dsa_payor"] = dsa_payor
+        return await self._request("POST", f"{acc}/adsets", data=data)

@@ -1,11 +1,10 @@
 import { Navigate, Route, Routes } from "react-router-dom";
-import { Rocket } from "lucide-react";
 import { useAuth } from "@/lib/auth";
 import { Login } from "@/pages/Login";
 import { Tokens } from "@/pages/Tokens";
 import { Dashboard } from "@/pages/Dashboard";
 import { BulkActions } from "@/pages/BulkActions";
-import { Placeholder } from "@/pages/Placeholder";
+import { Autozaliv } from "@/pages/Autozaliv";
 
 function FullScreenLoader() {
   return (
@@ -33,17 +32,7 @@ export default function App() {
       <Route path="/" element={<Dashboard />} />
       <Route path="/tokens" element={<Tokens />} />
       <Route path="/bulk" element={<BulkActions />} />
-      <Route
-        path="/launch"
-        element={
-          <Placeholder
-            title="Autozaliv"
-            description="Launch Sales / Purchase campaigns across multiple ad accounts"
-            icon={Rocket}
-            body="3-step wizard: pick template → pick accounts → upload creatives. Currently in design — UI lands next."
-          />
-        }
-      />
+      <Route path="/launch" element={<Autozaliv />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );
