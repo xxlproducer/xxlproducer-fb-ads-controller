@@ -6,6 +6,10 @@ $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 if (-not $root) { $root = (Get-Location).Path }
 
+# Strip Mark-of-the-Web from extracted ZIP files so future direct .ps1 calls
+# don't get blocked by execution policy. Safe; only affects local files.
+Get-ChildItem -Path $root -Recurse -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue
+
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host "  FB Ads Controller - first time setup" -ForegroundColor Cyan
