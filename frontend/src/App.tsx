@@ -5,6 +5,7 @@ import { Tokens } from "@/pages/Tokens";
 import { Dashboard } from "@/pages/Dashboard";
 import { BulkActions } from "@/pages/BulkActions";
 import { Autozaliv } from "@/pages/Autozaliv";
+import { Creatives } from "@/pages/Creatives";
 
 function FullScreenLoader() {
   return (
@@ -33,6 +34,7 @@ export default function App() {
       <Route path="/tokens" element={<Tokens />} />
       <Route path="/bulk" element={<BulkActions />} />
       <Route path="/launch" element={<Autozaliv />} />
+      <Route path="/creatives" element={<Creatives />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );

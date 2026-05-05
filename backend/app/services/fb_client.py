@@ -74,15 +74,29 @@ class FbClient:
         return httpx.AsyncClient(**kwargs)
 
     async def _request(
-        self, method: str, path: str, *, params: dict | None = None, data: dict | None = None
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict | None = None,
+        data: dict | None = None,
+        files: dict | None = None,
+        timeout: float | None = None,
     ) -> Any:
         url = f"{self.base_url}/{path.lstrip('/')}"
         merged_params = dict(params or {})
         merged_params.setdefault("access_token", self.access_token)
 
-        async with self._client() as client:
+        # Use a longer timeout for uploads
+        client_kwargs: dict[str, Any] = {"timeout": timeout or self.timeout}
+        if self.proxy_url:
+            client_kwargs["proxy"] = self.proxy_url
+
+        async with httpx.AsyncClient(**client_kwargs) as client:
             try:
-                resp = await client.request(method, url, params=merged_params, data=data)
+                resp = await client.request(
+                    method, url, params=merged_params, data=data, files=files
+                )
             except httpx.RequestError as exc:
                 logger.warning("FB request error %s: %s", url, exc)
                 raise FbApiError(code=None, message=f"network error: {exc}") from exc
@@ -381,3 +395,131 @@ class FbClient:
         if dsa_payor:
             data["dsa_payor"] = dsa_payor
         return await self._request("POST", f"{acc}/adsets", data=data)
+
+    # ----------------------------------------------------------- creatives
+
+    async def upload_image(
+        self,
+        account_id: str,
+        *,
+        filename: str,
+        content: bytes,
+        mime: str = "image/jpeg",
+    ) -> str:
+        """Upload an image to /act_<id>/adimages and return its hash.
+
+        FB returns `{"images": {"<filename>": {"hash": "...", "url": "..."}}}`
+        """
+        acc = account_id if account_id.startswith("act_") else f"act_{account_id}"
+        files = {"source": (filename, content, mime)}
+        payload = await self._request(
+            "POST", f"{acc}/adimages", files=files, timeout=120.0
+        )
+        images = (payload or {}).get("images") or {}
+        if not images:
+            raise FbApiError(code=None, message="upload_image: no hash returned")
+        # FB keys by an arbitrary basename; just take the first.
+        first = next(iter(images.values()))
+        h = first.get("hash")
+        if not h:
+            raise FbApiError(code=None, message="upload_image: missing hash field")
+        return h
+
+    async def upload_video(
+        self,
+        account_id: str,
+        *,
+        filename: str,
+        content: bytes,
+        mime: str = "video/mp4",
+    ) -> str:
+        """Upload a video to /act_<id>/advideos and return its id."""
+        acc = account_id if account_id.startswith("act_") else f"act_{account_id}"
+        files = {"source": (filename, content, mime)}
+        payload = await self._request(
+            "POST", f"{acc}/advideos", files=files, timeout=300.0
+        )
+        vid = (payload or {}).get("id")
+        if not vid:
+            raise FbApiError(code=None, message="upload_video: no id returned")
+        return str(vid)
+
+    async def create_ad_creative(
+        self,
+        account_id: str,
+        *,
+        name: str,
+        page_id: str,
+        link_url: str,
+        message: str | None = None,
+        headline: str | None = None,
+        description: str | None = None,
+        cta_type: str | None = None,
+        image_hash: str | None = None,
+        video_id: str | None = None,
+        thumbnail_url: str | None = None,
+        instagram_actor_id: str | None = None,
+    ) -> dict[str, Any]:
+        """POST /act_<id>/adcreatives. Returns the new creative payload (id)."""
+        acc = account_id if account_id.startswith("act_") else f"act_{account_id}"
+
+        link_data: dict[str, Any] = {"link": link_url}
+        if message:
+            link_data["message"] = message
+        if headline:
+            link_data["name"] = headline
+        if description:
+            link_data["description"] = description
+        if cta_type:
+            link_data["call_to_action"] = {
+                "type": cta_type,
+                "value": {"link": link_url},
+            }
+        if image_hash:
+            link_data["image_hash"] = image_hash
+
+        object_story_spec: dict[str, Any] = {"page_id": page_id}
+
+        if video_id:
+            video_data: dict[str, Any] = {
+                "video_id": video_id,
+                "title": headline or name,
+                "message": message or "",
+                "call_to_action": {
+                    "type": cta_type or "LEARN_MORE",
+                    "value": {"link": link_url},
+                },
+            }
+            if thumbnail_url:
+                video_data["image_url"] = thumbnail_url
+            object_story_spec["video_data"] = video_data
+        else:
+            object_story_spec["link_data"] = link_data
+
+        if instagram_actor_id:
+            object_story_spec["instagram_actor_id"] = instagram_actor_id
+
+        data: dict[str, Any] = {
+            "name": name,
+            "object_story_spec": json.dumps(object_story_spec),
+        }
+        return await self._request("POST", f"{acc}/adcreatives", data=data)
+
+    async def create_ad(
+        self,
+        account_id: str,
+        *,
+        name: str,
+        adset_id: str,
+        creative_id: str,
+        status: str = "PAUSED",
+    ) -> dict[str, Any]:
+        """POST /act_<id>/ads. Attaches an existing creative to an adset."""
+        acc = account_id if account_id.startswith("act_") else f"act_{account_id}"
+        data: dict[str, Any] = {
+            "name": name,
+            "adset_id": adset_id,
+            "creative": json.dumps({"creative_id": creative_id}),
+            "status": status,
+        }
+        return await self._request("POST", f"{acc}/ads", data=data)

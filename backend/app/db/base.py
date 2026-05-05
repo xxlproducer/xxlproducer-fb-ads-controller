@@ -12,6 +12,12 @@ class Base(DeclarativeBase):
 
 def init_db() -> None:
     # Importing models registers them on Base.metadata
-    from app.models import bulk_action_log, fb_token, launch_template, user  # noqa: F401
+    from app.models import (  # noqa: F401
+        bulk_action_log,
+        creative,
+        fb_token,
+        launch_template,
+        user,
+    )
 
     Base.metadata.create_all(bind=engine)

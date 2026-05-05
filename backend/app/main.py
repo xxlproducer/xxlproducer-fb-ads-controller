@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 
-from app.api import auth, bulk, dashboard, fb_accounts, health, launch, tokens
+from app.api import auth, bulk, creatives, dashboard, fb_accounts, health, launch, tokens
 from app.core.config import settings
 from app.db.base import init_db
 
@@ -55,6 +55,7 @@ app.include_router(fb_accounts.router, prefix="/api/fb-accounts")
 app.include_router(dashboard.router, prefix="/api/dashboard")
 app.include_router(bulk.router, prefix="/api/bulk")
 app.include_router(launch.router, prefix="/api/launch")
+app.include_router(creatives.router, prefix="/api/creatives")
 
 
 # Static frontend (Vite build) — served when present
