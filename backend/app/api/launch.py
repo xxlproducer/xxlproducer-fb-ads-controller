@@ -168,6 +168,79 @@ async def account_health(
 
     token_ids = {t.token_id for t in request.targets}
     tokens = _resolve_tokens(db, token_ids)
+    return await _account_health(request, tokens)
+
+
+# ===================================================================
+#                       Geo targeting search
+# ===================================================================
+
+
+@router.get("/search_geo")
+async def search_geo(
+    q: str,
+    token_id: int | None = None,
+    location_types: str | None = None,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """Live FB geo-targeting search.
+
+    Returns the raw FB rows so the frontend can keep `key`, `country_code`,
+    `country_name`, `name`, `type`, `region`, `region_id`, `supports_region`
+    etc. and pass them straight back into a targeting spec.
+    """
+    if not q or len(q.strip()) < 2:
+        return {"data": []}
+
+    token = _pick_token(db, token_id)
+    if token is None:
+        raise HTTPException(status_code=400, detail="no FB token configured")
+
+    types = [t.strip() for t in (location_types or "").split(",") if t.strip()] or None
+    client = FbClient(token.access_token)
+    rows = await client.search_geo(q.strip(), location_types=types)
+    return {"data": rows}
+
+
+@router.post("/lookup_geo")
+async def lookup_geo(
+    payload: dict,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """Resolve a list of FB geo `key`s back into full geo records.
+
+    Used to render existing template targeting (we only persist the FB
+    `key` / `country_code` per row) into the picker without dropping
+    metadata like `name` and `type`.
+    """
+    keys = payload.get("keys") or []
+    token_id = payload.get("token_id")
+    if not isinstance(keys, list) or not keys:
+        return {"data": []}
+
+    token = _pick_token(db, token_id if isinstance(token_id, int) else None)
+    if token is None:
+        raise HTTPException(status_code=400, detail="no FB token configured")
+
+    client = FbClient(token.access_token)
+    rows = await client.lookup_geo_by_keys([str(k) for k in keys])
+    return {"data": rows}
+
+
+def _pick_token(db: Session, token_id: int | None) -> FbToken | None:
+    """Use the requested token if given, otherwise the first one."""
+    q = db.query(FbToken)
+    if token_id:
+        return q.filter(FbToken.id == token_id).first()
+    return q.order_by(FbToken.id.asc()).first()
+
+
+async def _account_health(
+    request: AccountHealthRequest,
+    tokens: dict[int, FbToken],
+) -> AccountHealthResponse:
 
     # ad_account_id -> human metadata (name etc.)
     meta_per_token: dict[int, dict[str, dict[str, Any]]] = {}
@@ -256,11 +329,67 @@ def _normalize_acc(account_id: str) -> str:
     return account_id[4:] if account_id.startswith("act_") else account_id
 
 
+def _build_geo_locations(targeting: dict[str, Any]) -> dict[str, Any]:
+    """Convert our flat `geo_locations_picked` list (FB-validated rows)
+    into FB's nested `geo_locations` targeting structure.
+
+    Falls back to plain `countries` for legacy templates that predate
+    the picker.
+    """
+    picked = targeting.get("geo_locations_picked") or []
+    if picked:
+        countries: list[str] = []
+        country_groups: list[str] = []
+        regions: list[dict[str, str]] = []
+        cities: list[dict[str, str]] = []
+        zips: list[dict[str, str]] = []
+        for row in picked:
+            t = row.get("type")
+            key = row.get("key")
+            if not key:
+                continue
+            if t == "country":
+                countries.append(key)
+            elif t == "country_group":
+                country_groups.append(key)
+            elif t == "region":
+                regions.append({"key": key})
+            elif t == "city":
+                cities.append({"key": key})
+            elif t == "zip":
+                zips.append({"key": key})
+        out: dict[str, Any] = {}
+        if countries:
+            out["countries"] = countries
+        if country_groups:
+            out["country_groups"] = country_groups
+        if regions:
+            out["regions"] = regions
+        if cities:
+            out["cities"] = cities
+        if zips:
+            out["zips"] = zips
+        if out:
+            return out
+    return {"countries": targeting.get("countries") or []}
+
+
 def _targeting_summary(t: dict[str, Any]) -> str:
     parts: list[str] = []
-    countries = t.get("countries") or []
-    if countries:
-        parts.append("/".join(countries[:5]))
+    picked = t.get("geo_locations_picked") or []
+    if picked:
+        labels: list[str] = []
+        for row in picked[:5]:
+            label = row.get("name") or row.get("key") or ""
+            if label:
+                labels.append(label)
+        if labels:
+            extra = "" if len(picked) <= 5 else f" +{len(picked) - 5}"
+            parts.append("/".join(labels) + extra)
+    else:
+        countries = t.get("countries") or []
+        if countries:
+            parts.append("/".join(countries[:5]))
     age_min = t.get("age_min", 18)
     age_max = t.get("age_max", 65)
     parts.append(f"{age_min}-{age_max}")
@@ -436,9 +565,8 @@ async def launch_execute(
 
             # 2. Create adset
             targeting = cfg.adset.targeting.model_dump()
-            # FB expects countries inside geo_locations
             fb_targeting: dict[str, Any] = {
-                "geo_locations": {"countries": targeting.get("countries") or []},
+                "geo_locations": _build_geo_locations(targeting),
                 "age_min": targeting.get("age_min", 18),
                 "age_max": targeting.get("age_max", 65),
             }
@@ -698,7 +826,7 @@ async def launch_execute_v2(
             # Build targeting once.
             targeting = cfg.adset.targeting.model_dump()
             fb_targeting: dict[str, Any] = {
-                "geo_locations": {"countries": targeting.get("countries") or []},
+                "geo_locations": _build_geo_locations(targeting),
                 "age_min": targeting.get("age_min", 18),
                 "age_max": targeting.get("age_max", 65),
             }
@@ -714,6 +842,16 @@ async def launch_execute_v2(
                 po = cfg.adset.promoted_object.model_dump(exclude_none=True)
                 if po:
                     promoted_object = po
+
+            # Per-account pixel override (Sales / Leads / Conversions). Always
+            # applied if the user picked one — even when the template had no
+            # promoted_object — because objectives that need a pixel will be
+            # rejected by FB without it.
+            override_pixel = request.pixel_id_per_account.get(page_key)
+            if override_pixel:
+                if promoted_object is None:
+                    promoted_object = {}
+                promoted_object["pixel_id"] = override_pixel
 
             campaigns_out: list[CampaignResultV2] = []
             flat_ad_idx = 0

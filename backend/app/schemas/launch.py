@@ -10,6 +10,24 @@ from pydantic import BaseModel, Field
 # --- nested config ----------------------------------------------------------
 
 
+class GeoEntry(BaseModel):
+    """One picked FB geo location.
+
+    Mirrors the rows returned by FB's `GET /search?type=adgeolocation`
+    endpoint, keeping enough metadata to render the picker without a
+    re-lookup AND to serialise back into FB's targeting `geo_locations`
+    structure on launch.
+    """
+
+    key: str  # "PL" / "US" / numeric region/city id
+    type: str  # "country" | "country_group" | "region" | "city" | ...
+    name: str | None = None
+    country_code: str | None = None
+    country_name: str | None = None
+    region: str | None = None
+    region_id: int | None = None
+
+
 class TargetingConfig(BaseModel):
     """Subset of FB targeting spec we expose to the user.
 
@@ -17,6 +35,10 @@ class TargetingConfig(BaseModel):
     """
 
     countries: list[str] = Field(default_factory=list)
+    # Live FB-validated entries. When non-empty this REPLACES `countries`
+    # in the FB targeting payload, since FB picker covers regions/cities
+    # too. `countries` stays for backwards-compatible templates.
+    geo_locations_picked: list[GeoEntry] = Field(default_factory=list)
     age_min: int = 18
     age_max: int = 65
     genders: list[int] = Field(default_factory=list)  # [] = all, [1]=male, [2]=female
@@ -221,6 +243,12 @@ class LaunchRequestV2(BaseModel):
 
     # "{token_id}:{account_id}" -> page_id, only relevant when n_ads_per_adset>0
     page_id_per_account: dict[str, str] = Field(default_factory=dict)
+
+    # "{token_id}:{account_id}" -> pixel_id, used to override the template's
+    # promoted_object.pixel_id per account (Sales / Leads / Conversions).
+    # When set for an account it takes precedence; otherwise falls back to
+    # the template's pixel_id (if any).
+    pixel_id_per_account: dict[str, str] = Field(default_factory=dict)
 
     # Name patterns. Available placeholders:
     #   {tpl}     — template name
