@@ -180,3 +180,94 @@ class AccountHealthRequest(BaseModel):
 
 class AccountHealthResponse(BaseModel):
     accounts: list[AccountHealth]
+
+
+# --- v2 launch (full Campaign + AdSet + Ad with topology + creatives) -----
+
+
+class Topology(BaseModel):
+    """How many of each level to create per (token, ad-account) target."""
+
+    n_campaigns: int = Field(default=1, ge=1, le=20)
+    n_adsets_per_campaign: int = Field(default=1, ge=1, le=20)
+    n_ads_per_adset: int = Field(default=0, ge=0, le=20)
+    # n_ads_per_adset = 0 means "no Ads created, only Campaign + AdSet skeleton"
+    # (= legacy MVP behavior; ad creation needs creatives selected).
+
+
+class CreativeDistribution(BaseModel):
+    """How creatives map onto Ads in the topology.
+
+    `creative_ids` are local Creative.id values from /api/creatives.
+
+    mode:
+      * broadcast    — one creative cloned to all Ads.
+      * round_robin  — cycle through creatives across Ads (1->ad1, 2->ad2,
+                       3->ad3, 1->ad4, ...). Default and most flexible.
+      * one_per_ad   — strict: requires len(creative_ids) == total_ads,
+                       mapped 1:1 in order.
+    """
+
+    mode: Literal["broadcast", "round_robin", "one_per_ad"] = "round_robin"
+    creative_ids: list[int] = Field(default_factory=list)
+
+
+class LaunchRequestV2(BaseModel):
+    template_id: int
+    targets: list[AccountTarget]
+
+    topology: Topology = Field(default_factory=Topology)
+    distribution: CreativeDistribution | None = None
+
+    # "{token_id}:{account_id}" -> page_id, only relevant when n_ads_per_adset>0
+    page_id_per_account: dict[str, str] = Field(default_factory=dict)
+
+    # Name patterns. Available placeholders:
+    #   {tpl}     — template name
+    #   {account} — ad account name (or id if no name)
+    #   {c}       — 1-based campaign index
+    #   {a}       — 1-based adset index
+    #   {k}       — 1-based ad index
+    campaign_name_pattern: str | None = None
+    adset_name_pattern: str | None = None
+    ad_name_pattern: str | None = None
+
+    # Status for created Ads (Campaign / AdSet status comes from template).
+    ad_status: Literal["PAUSED", "ACTIVE"] = "PAUSED"
+
+
+class AdResultV2(BaseModel):
+    name: str
+    creative_id: int | None = None  # local Creative.id used
+    fb_creative_id: str | None = None
+    ad_id: str | None = None
+    error: str | None = None
+
+
+class AdSetResultV2(BaseModel):
+    name: str
+    adset_id: str | None = None
+    error: str | None = None
+    ads: list[AdResultV2] = Field(default_factory=list)
+
+
+class CampaignResultV2(BaseModel):
+    name: str
+    campaign_id: str | None = None
+    error: str | None = None
+    adsets: list[AdSetResultV2] = Field(default_factory=list)
+
+
+class LaunchResultV2(BaseModel):
+    token_id: int
+    account_id: str
+    ok: bool
+    error: str | None = None
+    campaigns: list[CampaignResultV2] = Field(default_factory=list)
+
+
+class LaunchResponseV2(BaseModel):
+    results: list[LaunchResultV2]
+    summary: dict[str, int] = Field(default_factory=dict)
+    # summary contains: campaigns_ok, campaigns_failed, adsets_ok,
+    # adsets_failed, ads_ok, ads_failed

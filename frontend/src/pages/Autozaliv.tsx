@@ -110,19 +110,6 @@ interface PreviewResponse {
   warnings: string[];
 }
 
-interface LaunchResult {
-  token_id: number;
-  account_id: string;
-  ok: boolean;
-  campaign_id: string | null;
-  adset_id: string | null;
-  error: string | null;
-}
-
-interface LaunchResponse {
-  results: LaunchResult[];
-}
-
 interface PixelInfo {
   id: string;
   name: string | null;
@@ -148,6 +135,48 @@ interface AccountHealth {
 
 interface AccountHealthResponse {
   accounts: AccountHealth[];
+}
+
+interface AdResultV2 {
+  name: string;
+  creative_id: number | null;
+  fb_creative_id: string | null;
+  ad_id: string | null;
+  error: string | null;
+}
+
+interface AdSetResultV2 {
+  name: string;
+  adset_id: string | null;
+  error: string | null;
+  ads: AdResultV2[];
+}
+
+interface CampaignResultV2 {
+  name: string;
+  campaign_id: string | null;
+  error: string | null;
+  adsets: AdSetResultV2[];
+}
+
+interface LaunchResultV2 {
+  token_id: number;
+  account_id: string;
+  ok: boolean;
+  error: string | null;
+  campaigns: CampaignResultV2[];
+}
+
+interface LaunchResponseV2 {
+  results: LaunchResultV2[];
+  summary: {
+    campaigns_ok?: number;
+    campaigns_failed?: number;
+    adsets_ok?: number;
+    adsets_failed?: number;
+    ads_ok?: number;
+    ads_failed?: number;
+  };
 }
 
 // ---------------------------------------------------------------- defaults
@@ -439,7 +468,18 @@ function defaultConfig(): TemplateConfig {
 
 // ---------------------------------------------------------------- main page
 
-type Step = "template" | "accounts" | "review";
+type Step = "template" | "accounts" | "topology" | "review";
+
+interface TopologyState {
+  n_campaigns: number;
+  n_adsets_per_campaign: number;
+  n_ads_per_adset: number;
+}
+
+interface DistributionState {
+  mode: "broadcast" | "round_robin" | "one_per_ad";
+  creative_ids: number[];
+}
 
 export function Autozaliv() {
   const [step, setStep] = useState<Step>("template");
@@ -447,10 +487,22 @@ export function Autozaliv() {
   const [selectedAccounts, setSelectedAccounts] = useState<Set<string>>(new Set());
   // selectedAccounts keys are `${token_id}:${account_id}` so we keep the pair.
 
+  const [topology, setTopology] = useState<TopologyState>({
+    n_campaigns: 1,
+    n_adsets_per_campaign: 1,
+    n_ads_per_adset: 0,
+  });
+  const [distribution, setDistribution] = useState<DistributionState>({
+    mode: "round_robin",
+    creative_ids: [],
+  });
+  // "{token_id}:{account_id}" -> page_id
+  const [pagePerAccount, setPagePerAccount] = useState<Record<string, string>>({});
+
   return (
     <Layout
       title="Autozaliv"
-      description="Launch Campaigns + AdSets across multiple ad accounts in one go"
+      description="Launch Campaigns + AdSets + Ads across multiple ad accounts in one go"
     >
       <Stepper step={step} />
       {step === "template" && (
@@ -467,6 +519,19 @@ export function Autozaliv() {
           selected={selectedAccounts}
           setSelected={setSelectedAccounts}
           onBack={() => setStep("template")}
+          onNext={() => setStep("topology")}
+        />
+      )}
+      {step === "topology" && selectedTemplateId !== null && (
+        <TopologyStep
+          selected={selectedAccounts}
+          topology={topology}
+          setTopology={setTopology}
+          distribution={distribution}
+          setDistribution={setDistribution}
+          pagePerAccount={pagePerAccount}
+          setPagePerAccount={setPagePerAccount}
+          onBack={() => setStep("accounts")}
           onNext={() => setStep("review")}
         />
       )}
@@ -474,7 +539,10 @@ export function Autozaliv() {
         <ReviewStep
           templateId={selectedTemplateId}
           selected={selectedAccounts}
-          onBack={() => setStep("accounts")}
+          topology={topology}
+          distribution={distribution}
+          pagePerAccount={pagePerAccount}
+          onBack={() => setStep("topology")}
         />
       )}
     </Layout>
@@ -487,7 +555,8 @@ function Stepper({ step }: { step: Step }) {
   const items: { id: Step; label: string }[] = [
     { id: "template", label: "1. Template" },
     { id: "accounts", label: "2. Accounts" },
-    { id: "review", label: "3. Review & launch" },
+    { id: "topology", label: "3. Structure & creatives" },
+    { id: "review", label: "4. Review & launch" },
   ];
   const activeIdx = items.findIndex((i) => i.id === step);
   return (
@@ -1196,15 +1265,432 @@ function AccountsStep({
   );
 }
 
-// ---------------------------------------------------------------- step 3: review
+// ---------------------------------------------------------------- step 3: topology + creatives + page
+
+interface CreativeLite {
+  id: number;
+  name: string;
+  media_type: "image" | "video";
+  thumbnail_filename: string | null;
+  title: string | null;
+  body: string | null;
+  link_url: string | null;
+  page_id: string | null;
+}
+
+function TopologyStep({
+  selected,
+  topology,
+  setTopology,
+  distribution,
+  setDistribution,
+  pagePerAccount,
+  setPagePerAccount,
+  onBack,
+  onNext,
+}: {
+  selected: Set<string>;
+  topology: TopologyState;
+  setTopology: (t: TopologyState) => void;
+  distribution: DistributionState;
+  setDistribution: (d: DistributionState) => void;
+  pagePerAccount: Record<string, string>;
+  setPagePerAccount: (p: Record<string, string>) => void;
+  onBack: () => void;
+  onNext: () => void;
+}) {
+  const targets = useMemo(
+    () =>
+      Array.from(selected).map((k) => {
+        const [token_id, account_id] = k.split(":");
+        return { token_id: Number(token_id), account_id };
+      }),
+    [selected],
+  );
+
+  const creativesQuery = useQuery({
+    queryKey: ["creatives-list-for-launch"],
+    queryFn: async (): Promise<CreativeLite[]> => {
+      const r = await api.get("/creatives");
+      return r.data;
+    },
+  });
+
+  // Pages + pixels per account, used to populate page dropdowns.
+  const healthQuery = useQuery({
+    queryKey: ["topology-account-health", targets],
+    queryFn: async (): Promise<AccountHealthResponse> => {
+      const r = await api.post("/launch/account_health", { targets });
+      return r.data;
+    },
+    enabled: targets.length > 0,
+  });
+
+  const totalPerAccount =
+    Math.max(1, topology.n_campaigns) *
+    Math.max(1, topology.n_adsets_per_campaign) *
+    Math.max(0, topology.n_ads_per_adset);
+  const totalAcrossAccounts = totalPerAccount * targets.length;
+  const wantsAds = topology.n_ads_per_adset > 0;
+
+  const onePerAdMismatch =
+    distribution.mode === "one_per_ad" &&
+    distribution.creative_ids.length !== totalPerAccount;
+
+  // Validate every account has a page selected when ads are wanted.
+  const accountsMissingPage = wantsAds
+    ? targets.filter((t) => {
+        const key = `${t.token_id}:${t.account_id}`;
+        return !pagePerAccount[key];
+      })
+    : [];
+
+  const canNext =
+    targets.length > 0 &&
+    topology.n_campaigns >= 1 &&
+    topology.n_adsets_per_campaign >= 1 &&
+    (!wantsAds ||
+      (distribution.creative_ids.length > 0 &&
+        !onePerAdMismatch &&
+        accountsMissingPage.length === 0));
+
+  const toggleCreative = (id: number) => {
+    if (distribution.creative_ids.includes(id)) {
+      setDistribution({
+        ...distribution,
+        creative_ids: distribution.creative_ids.filter((c) => c !== id),
+      });
+    } else {
+      setDistribution({
+        ...distribution,
+        creative_ids: [...distribution.creative_ids, id],
+      });
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <Section title="Structure (per account)">
+        <p className="-mt-1 mb-3 text-xs text-ink-500">
+          Pick how many Campaigns, AdSets and Ads to create on{" "}
+          <strong>each</strong> selected account. Set Ads = 0 to skip ad
+          creation (creates Campaigns + AdSets only — you can add ads later).
+        </p>
+        <div className="grid gap-3 md:grid-cols-3">
+          <NumberInput
+            label="Campaigns"
+            value={topology.n_campaigns}
+            min={1}
+            max={20}
+            onChange={(v) => setTopology({ ...topology, n_campaigns: v })}
+          />
+          <NumberInput
+            label="AdSets per campaign"
+            value={topology.n_adsets_per_campaign}
+            min={1}
+            max={20}
+            onChange={(v) =>
+              setTopology({ ...topology, n_adsets_per_campaign: v })
+            }
+          />
+          <NumberInput
+            label="Ads per adset"
+            value={topology.n_ads_per_adset}
+            min={0}
+            max={20}
+            onChange={(v) => setTopology({ ...topology, n_ads_per_adset: v })}
+          />
+        </div>
+        <div className="mt-3 rounded-lg border border-ink-200 bg-ink-50 p-3 text-sm dark:border-ink-700 dark:bg-ink-800/30">
+          Per account:{" "}
+          <strong>
+            {topology.n_campaigns} campaign{topology.n_campaigns > 1 ? "s" : ""}{" "}
+            × {topology.n_adsets_per_campaign} adset
+            {topology.n_adsets_per_campaign > 1 ? "s" : ""} ×{" "}
+            {topology.n_ads_per_adset} ad
+            {topology.n_ads_per_adset !== 1 ? "s" : ""}
+          </strong>{" "}
+          = {totalPerAccount} ad{totalPerAccount !== 1 ? "s" : ""} per account.
+          <br />
+          <span className="text-xs text-ink-500">
+            Across {targets.length} account{targets.length !== 1 ? "s" : ""}:{" "}
+            {totalAcrossAccounts} ad{totalAcrossAccounts !== 1 ? "s" : ""} total.
+          </span>
+        </div>
+      </Section>
+
+      {wantsAds && (
+        <Section title="Page (per account)">
+          <p className="-mt-1 mb-3 text-xs text-ink-500">
+            Every Ad needs a Facebook Page. We pulled the Pages each account
+            can promote — pick the right one per account. (FB needs this even
+            for video ads.)
+          </p>
+          {healthQuery.isLoading && (
+            <div className="flex items-center gap-2 text-xs text-ink-500">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              Loading pages…
+            </div>
+          )}
+          <div className="grid gap-2 md:grid-cols-2">
+            {healthQuery.data?.accounts.map((a) => {
+              const key = `${a.token_id}:${a.account_id}`;
+              return (
+                <div
+                  key={key}
+                  className="rounded-lg border border-ink-200 bg-white p-2 dark:border-ink-700 dark:bg-ink-800/30"
+                >
+                  <div className="text-xs font-medium">
+                    {a.account_name || `act_${a.account_id}`}
+                  </div>
+                  <div className="text-[11px] text-ink-500">
+                    act_{a.account_id}
+                  </div>
+                  {a.pages.length === 0 ? (
+                    <div className="mt-1 text-xs text-rose-600">
+                      No promotable Pages on this account.{" "}
+                      <a
+                        href="https://www.facebook.com/business/help/1593627458007959"
+                        target="_blank"
+                        rel="noreferrer"
+                        className="underline"
+                      >
+                        Connect one
+                      </a>
+                      .
+                    </div>
+                  ) : (
+                    <select
+                      className="mt-1 w-full rounded-md border border-ink-200 bg-white px-2 py-1 text-xs dark:border-ink-600 dark:bg-ink-800"
+                      value={pagePerAccount[key] ?? ""}
+                      onChange={(e) =>
+                        setPagePerAccount({
+                          ...pagePerAccount,
+                          [key]: e.target.value,
+                        })
+                      }
+                    >
+                      <option value="">— select page —</option>
+                      {a.pages.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name || p.id}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          {accountsMissingPage.length > 0 && (
+            <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">
+              ⚠ {accountsMissingPage.length} account(s) still need a Page
+              selected.
+            </p>
+          )}
+        </Section>
+      )}
+
+      {wantsAds && (
+        <Section title="Creatives">
+          <p className="-mt-1 mb-3 text-xs text-ink-500">
+            Pick creatives from your library. Need to upload new ones?{" "}
+            <a href="/creatives" className="underline">
+              Open Creative library →
+            </a>
+          </p>
+
+          <div className="mb-3 grid gap-2 md:grid-cols-3">
+            {(
+              [
+                {
+                  id: "round_robin" as const,
+                  label: "Round-robin",
+                  hint: "Cycle through creatives across ads",
+                },
+                {
+                  id: "broadcast" as const,
+                  label: "Broadcast",
+                  hint: "Same creative on every ad",
+                },
+                {
+                  id: "one_per_ad" as const,
+                  label: "One per ad",
+                  hint: `Strict 1:1 (need ${totalPerAccount} creatives)`,
+                },
+              ]
+            ).map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                onClick={() => setDistribution({ ...distribution, mode: m.id })}
+                className={cn(
+                  "rounded-lg border px-3 py-2 text-left text-sm transition-all",
+                  distribution.mode === m.id
+                    ? "border-accent bg-accent/10"
+                    : "border-ink-200 hover:bg-ink-50 dark:border-ink-700 dark:hover:bg-ink-800",
+                )}
+              >
+                <div className="font-medium">{m.label}</div>
+                <div className="text-[11px] leading-tight text-ink-500">
+                  {m.hint}
+                </div>
+              </button>
+            ))}
+          </div>
+
+          {creativesQuery.isLoading && (
+            <div className="flex items-center gap-2 text-xs text-ink-500">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              Loading creatives…
+            </div>
+          )}
+          {creativesQuery.data && creativesQuery.data.length === 0 && (
+            <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs text-amber-700 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-300">
+              You have no creatives yet.{" "}
+              <a href="/creatives" className="underline">
+                Upload your first creative →
+              </a>
+            </div>
+          )}
+          {creativesQuery.data && creativesQuery.data.length > 0 && (
+            <div className="grid gap-2 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
+              {creativesQuery.data.map((c) => {
+                const idx = distribution.creative_ids.indexOf(c.id);
+                const picked = idx >= 0;
+                return (
+                  <button
+                    key={c.id}
+                    type="button"
+                    onClick={() => toggleCreative(c.id)}
+                    className={cn(
+                      "relative flex flex-col gap-1 rounded-xl border p-2 text-left text-xs transition-all",
+                      picked
+                        ? "border-accent ring-1 ring-accent/40"
+                        : "border-ink-200 hover:bg-ink-50 dark:border-ink-700 dark:hover:bg-ink-800",
+                    )}
+                  >
+                    {picked && (
+                      <span className="absolute right-2 top-2 inline-flex h-5 w-5 items-center justify-center rounded-full bg-accent text-[10px] font-bold text-white">
+                        {idx + 1}
+                      </span>
+                    )}
+                    {c.thumbnail_filename ? (
+                      <img
+                        src={`/api/creatives/${c.id}/media?thumb=1`}
+                        alt=""
+                        className="h-24 w-full rounded-md object-cover"
+                      />
+                    ) : (
+                      <div className="flex h-24 w-full items-center justify-center rounded-md bg-ink-100 text-ink-400 dark:bg-ink-800">
+                        {c.media_type === "video" ? "VIDEO" : "IMG"}
+                      </div>
+                    )}
+                    <div className="font-medium">{c.name}</div>
+                    {c.title && (
+                      <div className="line-clamp-1 text-ink-500">{c.title}</div>
+                    )}
+                    {!c.link_url && (
+                      <div className="text-[10px] text-rose-600">
+                        Missing link_url — set on /creatives
+                      </div>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          <div className="mt-3 rounded-lg border border-ink-200 bg-ink-50 p-2 text-xs dark:border-ink-700 dark:bg-ink-800/30">
+            Selected: <strong>{distribution.creative_ids.length}</strong>{" "}
+            creative(s).
+            {distribution.mode === "round_robin" && (
+              <>
+                {" "}
+                Will be cycled across{" "}
+                <strong>{totalPerAccount}</strong> ad(s) per account.
+              </>
+            )}
+            {distribution.mode === "broadcast" &&
+              distribution.creative_ids.length > 1 && (
+                <span className="text-amber-600">
+                  {" "}
+                  ⚠ Broadcast uses only the first creative — others ignored.
+                </span>
+              )}
+            {distribution.mode === "one_per_ad" && onePerAdMismatch && (
+              <span className="text-rose-600">
+                {" "}
+                ⚠ Need exactly {totalPerAccount}, picked{" "}
+                {distribution.creative_ids.length}.
+              </span>
+            )}
+          </div>
+        </Section>
+      )}
+
+      <div className="flex items-center justify-between border-t border-ink-200/60 pt-4 dark:border-ink-700/60">
+        <Button variant="secondary" onClick={onBack}>
+          <ArrowLeft className="h-4 w-4" />
+          Back
+        </Button>
+        <Button onClick={onNext} disabled={!canNext}>
+          Next: Review
+          <ArrowRight className="h-4 w-4" />
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function NumberInput({
+  label,
+  value,
+  onChange,
+  min = 0,
+  max,
+}: {
+  label: string;
+  value: number;
+  onChange: (v: number) => void;
+  min?: number;
+  max?: number;
+}) {
+  return (
+    <label className="block text-xs">
+      <span className="mb-1 block font-medium text-ink-600 dark:text-ink-300">
+        {label}
+      </span>
+      <input
+        type="number"
+        value={value}
+        min={min}
+        max={max}
+        onChange={(e) => {
+          const n = parseInt(e.target.value || "0", 10);
+          if (Number.isFinite(n)) onChange(n);
+        }}
+        className="w-full rounded-md border border-ink-200 bg-white px-2 py-1.5 text-sm dark:border-ink-600 dark:bg-ink-800"
+      />
+    </label>
+  );
+}
+
+// ---------------------------------------------------------------- step 4: review
 
 function ReviewStep({
   templateId,
   selected,
+  topology,
+  distribution,
+  pagePerAccount,
   onBack,
 }: {
   templateId: number;
   selected: Set<string>;
+  topology: TopologyState;
+  distribution: DistributionState;
+  pagePerAccount: Record<string, string>;
   onBack: () => void;
 }) {
   const targets = useMemo(
@@ -1259,14 +1745,26 @@ function ReviewStep({
   const blockingPreflight =
     requiresPixel && accountsMissingPixel.length > 0 && !healthQuery.isLoading;
 
-  const [launchResult, setLaunchResult] = useState<LaunchResponse | null>(null);
+  const [launchResult, setLaunchResult] = useState<LaunchResponseV2 | null>(
+    null,
+  );
   const [confirmOpen, setConfirmOpen] = useState(false);
 
+  const totalPerAccount =
+    Math.max(1, topology.n_campaigns) *
+    Math.max(1, topology.n_adsets_per_campaign) *
+    Math.max(0, topology.n_ads_per_adset);
+  const totalAcrossAccounts = totalPerAccount * targets.length;
+  const wantsAds = topology.n_ads_per_adset > 0;
+
   const launchMutation = useMutation({
-    mutationFn: async (): Promise<LaunchResponse> => {
-      const r = await api.post("/launch/execute", {
+    mutationFn: async (): Promise<LaunchResponseV2> => {
+      const r = await api.post("/launch/execute_v2", {
         template_id: templateId,
         targets,
+        topology,
+        distribution: wantsAds ? distribution : null,
+        page_id_per_account: wantsAds ? pagePerAccount : {},
       });
       return r.data;
     },
@@ -1275,9 +1773,10 @@ function ReviewStep({
       setConfirmOpen(false);
       const ok = data.results.filter((r) => r.ok).length;
       const fail = data.results.length - ok;
-      if (fail === 0) toast.success(`Launched ${ok} successfully`);
+      const adsOk = data.summary.ads_ok ?? 0;
+      if (fail === 0) toast.success(`Launched ${ok} ok (${adsOk} ads)`);
       else if (ok === 0) toast.error(`All ${fail} launches failed`);
-      else toast(`Launched ${ok} ok, ${fail} failed`);
+      else toast(`Launched ${ok} ok, ${fail} failed (${adsOk} ads created)`);
     },
     onError: (err) => toast.error(getApiErrorMessage(err)),
   });
@@ -1288,6 +1787,61 @@ function ReviewStep({
         Review what will be created. Nothing is sent to Facebook until you click{" "}
         <strong>Launch</strong>.
       </p>
+
+      <div className="rounded-xl border border-ink-200 bg-ink-50 p-3 text-sm dark:border-ink-700 dark:bg-ink-800/30">
+        <div className="font-medium">Plan</div>
+        <div className="mt-1 text-xs text-ink-600 dark:text-ink-300">
+          On <strong>{targets.length}</strong> account
+          {targets.length !== 1 ? "s" : ""}, create per account:{" "}
+          <strong>
+            {topology.n_campaigns} campaign
+            {topology.n_campaigns !== 1 ? "s" : ""}
+          </strong>{" "}
+          ×{" "}
+          <strong>
+            {topology.n_adsets_per_campaign} adset
+            {topology.n_adsets_per_campaign !== 1 ? "s" : ""}
+          </strong>{" "}
+          ×{" "}
+          <strong>
+            {topology.n_ads_per_adset} ad
+            {topology.n_ads_per_adset !== 1 ? "s" : ""}
+          </strong>
+          {wantsAds && (
+            <>
+              {" "}
+              · creatives:{" "}
+              <strong>{distribution.creative_ids.length}</strong> in{" "}
+              <code>{distribution.mode}</code> mode
+            </>
+          )}
+          .
+        </div>
+        <div className="mt-1 text-xs text-ink-500">
+          Total across all accounts:{" "}
+          <strong>
+            {topology.n_campaigns * targets.length} campaign
+            {topology.n_campaigns * targets.length !== 1 ? "s" : ""}
+          </strong>
+          ,{" "}
+          <strong>
+            {topology.n_campaigns *
+              topology.n_adsets_per_campaign *
+              targets.length}{" "}
+            adset
+            {topology.n_campaigns * topology.n_adsets_per_campaign * targets.length !==
+            1
+              ? "s"
+              : ""}
+          </strong>
+          ,{" "}
+          <strong>
+            {totalAcrossAccounts} ad
+            {totalAcrossAccounts !== 1 ? "s" : ""}
+          </strong>
+          .
+        </div>
+      </div>
 
       {previewQuery.isLoading && (
         <div className="flex h-40 items-center justify-center text-ink-400">
@@ -1446,7 +2000,11 @@ function ReviewStep({
           }
         >
           <Rocket className="h-4 w-4" />
-          Launch on {targets.length} account{targets.length > 1 ? "s" : ""}
+          Launch{" "}
+          {wantsAds
+            ? `${totalAcrossAccounts} ad${totalAcrossAccounts !== 1 ? "s" : ""}`
+            : `${topology.n_campaigns * topology.n_adsets_per_campaign * targets.length} adset${topology.n_adsets_per_campaign * topology.n_campaigns * targets.length !== 1 ? "s" : ""}`}{" "}
+          on {targets.length} account{targets.length > 1 ? "s" : ""}
         </Button>
       </div>
 
@@ -1486,14 +2044,13 @@ function LaunchResultModal({
   result,
   onClose,
 }: {
-  result: LaunchResponse;
+  result: LaunchResponseV2;
   onClose: () => void;
 }) {
-  const ok = result.results.filter((r) => r.ok);
-  const fail = result.results.filter((r) => !r.ok);
+  const s = result.summary;
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink-900/40 p-4 backdrop-blur-sm">
-      <div className="max-h-[90vh] w-full max-w-2xl animate-slide-up overflow-y-auto">
+      <div className="max-h-[90vh] w-full max-w-3xl animate-slide-up overflow-y-auto">
         <Card>
           <CardBody className="relative space-y-3">
             <button
@@ -1504,61 +2061,110 @@ function LaunchResultModal({
               <X className="h-4 w-4" />
             </button>
             <h2 className="text-lg font-semibold">Launch result</h2>
-            <div className="flex gap-4 text-sm">
+            <div className="flex flex-wrap gap-4 text-sm">
               <span className="text-emerald-600">
                 <CheckCircle2 className="mr-1 inline h-4 w-4" />
-                {ok.length} succeeded
+                {s.campaigns_ok ?? 0} campaigns
               </span>
-              {fail.length > 0 && (
+              <span className="text-emerald-600">
+                {s.adsets_ok ?? 0} adsets
+              </span>
+              <span className="text-emerald-600">
+                {s.ads_ok ?? 0} ads
+              </span>
+              {((s.campaigns_failed ?? 0) +
+                (s.adsets_failed ?? 0) +
+                (s.ads_failed ?? 0)) > 0 && (
                 <span className="text-rose-600">
                   <XCircle className="mr-1 inline h-4 w-4" />
-                  {fail.length} failed
+                  {(s.campaigns_failed ?? 0) + (s.adsets_failed ?? 0) + (s.ads_failed ?? 0)}{" "}
+                  failures
                 </span>
               )}
             </div>
 
-            {ok.length > 0 && (
-              <Section title="Succeeded">
-                <ul className="space-y-1 text-xs">
-                  {ok.map((r, i) => (
-                    <li
-                      key={i}
-                      className="rounded-md bg-emerald-50 px-2 py-1 dark:bg-emerald-900/20"
-                    >
-                      <span className="font-mono text-emerald-700 dark:text-emerald-300">
-                        act_{r.account_id}
-                      </span>{" "}
-                      → campaign{" "}
-                      <code className="text-[11px]">{r.campaign_id}</code>
-                      {r.adset_id && (
-                        <>
-                          {" "}
-                          · adset <code className="text-[11px]">{r.adset_id}</code>
-                        </>
+            <div className="space-y-3">
+              {result.results.map((r, i) => (
+                <div
+                  key={i}
+                  className="rounded-lg border border-ink-200 p-2 dark:border-ink-700"
+                >
+                  <div className="text-sm font-medium">
+                    <span className="font-mono">act_{r.account_id}</span>{" "}
+                    {r.ok ? (
+                      <span className="text-emerald-600">ok</span>
+                    ) : (
+                      <span className="text-rose-600">failed</span>
+                    )}
+                    {r.error && (
+                      <span className="ml-2 text-xs text-rose-600">
+                        {r.error}
+                      </span>
+                    )}
+                  </div>
+                  {r.campaigns.map((c, ci) => (
+                    <div
+                      key={ci}
+                      className={cn(
+                        "ml-2 mt-2 rounded-md border-l-2 pl-2 text-xs",
+                        c.campaign_id
+                          ? "border-emerald-400"
+                          : "border-rose-400",
                       )}
-                    </li>
-                  ))}
-                </ul>
-              </Section>
-            )}
-
-            {fail.length > 0 && (
-              <Section title="Failed">
-                <ul className="space-y-1 text-xs">
-                  {fail.map((r, i) => (
-                    <li
-                      key={i}
-                      className="rounded-md bg-rose-50 px-2 py-1 dark:bg-rose-900/20"
                     >
-                      <span className="font-mono text-rose-700 dark:text-rose-300">
-                        act_{r.account_id}
-                      </span>{" "}
-                      — {r.error}
-                    </li>
+                      <div>
+                        <strong>{c.name}</strong>{" "}
+                        {c.campaign_id ? (
+                          <code className="text-[11px]">{c.campaign_id}</code>
+                        ) : (
+                          <span className="text-rose-600">— {c.error}</span>
+                        )}
+                      </div>
+                      {c.adsets.map((a, ai) => (
+                        <div
+                          key={ai}
+                          className={cn(
+                            "ml-3 mt-1 rounded-md border-l-2 pl-2",
+                            a.adset_id
+                              ? "border-emerald-400"
+                              : "border-rose-400",
+                          )}
+                        >
+                          <div>
+                            {a.name}{" "}
+                            {a.adset_id ? (
+                              <code className="text-[11px]">{a.adset_id}</code>
+                            ) : (
+                              <span className="text-rose-600">
+                                — {a.error}
+                              </span>
+                            )}
+                          </div>
+                          {a.ads.map((ad, aki) => (
+                            <div
+                              key={aki}
+                              className={cn(
+                                "ml-3 mt-0.5",
+                                ad.ad_id ? "text-emerald-700" : "text-rose-600",
+                              )}
+                            >
+                              {ad.name}{" "}
+                              {ad.ad_id ? (
+                                <code className="text-[11px]">
+                                  {ad.ad_id}
+                                </code>
+                              ) : (
+                                <>— {ad.error}</>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      ))}
+                    </div>
                   ))}
-                </ul>
-              </Section>
-            )}
+                </div>
+              ))}
+            </div>
 
             <div className="flex justify-end pt-2">
               <Button variant="secondary" onClick={onClose}>

@@ -22,14 +22,23 @@ from app.models.bulk_action_log import BulkActionLog
 from app.models.fb_token import FbToken
 from app.models.launch_template import LaunchTemplate
 from app.models.user import User
+from app.core.config import settings
+from app.models.creative import Creative
 from app.schemas.launch import (
     AccountHealth,
     AccountHealthRequest,
     AccountHealthResponse,
     AccountTarget,
+    AdResultV2,
+    AdSetResultV2,
+    CampaignResultV2,
+    CreativeDistribution,
     LaunchRequest,
+    LaunchRequestV2,
     LaunchResponse,
+    LaunchResponseV2,
     LaunchResult,
+    LaunchResultV2,
     PageInfo,
     PixelInfo,
     PreviewResponse,
@@ -38,6 +47,7 @@ from app.schemas.launch import (
     TemplateCreate,
     TemplateOut,
     TemplateUpdate,
+    Topology,
 )
 from app.services.fb_client import FbApiError, FbClient
 
@@ -501,3 +511,402 @@ async def launch_execute(
     db.commit()
 
     return LaunchResponse(results=results)
+
+
+# ===================================================================
+#                    Execute v2 — full topology + creatives
+# ===================================================================
+
+
+def _pick_creative_index(
+    distribution: CreativeDistribution | None,
+    flat_index: int,
+    total_ads: int,
+) -> int | None:
+    """Return position into distribution.creative_ids (or None if no ads)."""
+    if not distribution or not distribution.creative_ids:
+        return None
+    n = len(distribution.creative_ids)
+    if distribution.mode == "broadcast":
+        return 0
+    if distribution.mode == "one_per_ad":
+        if n != total_ads:
+            # Caller validated this already; fall back to round-robin.
+            return flat_index % n
+        return flat_index
+    # round_robin (default)
+    return flat_index % n
+
+
+def _format_name(
+    pattern: str | None,
+    default: str,
+    *,
+    tpl: str,
+    account: str,
+    c: int,
+    a: int,
+    k: int,
+) -> str:
+    src = pattern or default
+    try:
+        return src.format(tpl=tpl, account=account, c=c, a=a, k=k)
+    except (KeyError, IndexError):
+        return src
+
+
+@router.post("/execute_v2", response_model=LaunchResponseV2)
+async def launch_execute_v2(
+    request: LaunchRequestV2,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> LaunchResponseV2:
+    """Create N campaigns × M adsets × K ads per (token, account).
+
+    Combines what used to be two separate flows (`/launch/execute` for
+    Campaign+AdSet and `/creatives/bulk_create_ads` for Ad creation) into
+    a single wizard step. Pure superset — `/launch/execute` and
+    `/creatives/bulk_create_ads` continue to work.
+    """
+    template = db.get(LaunchTemplate, request.template_id)
+    if not template:
+        raise HTTPException(status_code=404, detail="template not found")
+    if not request.targets:
+        raise HTTPException(status_code=400, detail="targets must be non-empty")
+
+    cfg = TemplateConfig.model_validate(template.get_config() or {})
+    tokens = _resolve_tokens(db, {t.token_id for t in request.targets})
+
+    total_ads_per_account = (
+        request.topology.n_campaigns
+        * request.topology.n_adsets_per_campaign
+        * request.topology.n_ads_per_adset
+    )
+
+    # Resolve and validate creatives if user wants Ads.
+    creatives_by_id: dict[int, Creative] = {}
+    if request.topology.n_ads_per_adset > 0:
+        if not request.distribution or not request.distribution.creative_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="distribution.creative_ids is required when n_ads_per_adset > 0",
+            )
+        ids = list(dict.fromkeys(request.distribution.creative_ids))
+        rows = db.query(Creative).filter(Creative.id.in_(ids)).all()
+        creatives_by_id = {c.id: c for c in rows}
+        missing = [i for i in ids if i not in creatives_by_id]
+        if missing:
+            raise HTTPException(
+                status_code=404, detail=f"creatives not found: {missing}"
+            )
+        if request.distribution.mode == "one_per_ad" and len(ids) != total_ads_per_account:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"one_per_ad needs exactly {total_ads_per_account} creatives "
+                    f"(topology yields {total_ads_per_account} ads per account); "
+                    f"got {len(ids)}"
+                ),
+            )
+        for c in creatives_by_id.values():
+            if not c.link_url:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"creative #{c.id} has no link_url; set one before launching",
+                )
+
+    # Resolve names for nicer naming defaults.
+    metas = await asyncio.gather(*(_account_meta(tok) for tok in tokens.values()))
+    meta_by_token = dict(zip(tokens.keys(), metas))
+
+    sem = asyncio.Semaphore(LAUNCH_CONCURRENCY)
+
+    summary = {
+        "campaigns_ok": 0,
+        "campaigns_failed": 0,
+        "adsets_ok": 0,
+        "adsets_failed": 0,
+        "ads_ok": 0,
+        "ads_failed": 0,
+    }
+    summary_lock = asyncio.Lock()
+
+    async def one(target: AccountTarget) -> LaunchResultV2:
+        async with sem:
+            tok = tokens.get(target.token_id)
+            if not tok:
+                return LaunchResultV2(
+                    token_id=target.token_id,
+                    account_id=target.account_id,
+                    ok=False,
+                    error=f"token #{target.token_id} not found or disabled",
+                )
+
+            client = FbClient(tok.access_token, proxy_url=tok.proxy_url)
+            norm_acc = _normalize_acc(target.account_id)
+            meta = meta_by_token.get(target.token_id, {}).get(norm_acc) or {}
+            account_label = meta.get("name") or f"act_{norm_acc}"
+
+            page_key = f"{target.token_id}:{norm_acc}"
+            page_id = request.page_id_per_account.get(page_key)
+
+            # Per-target asset cache: image_hash / video_id keyed by creative.id
+            account_assets_cache: dict[int, dict[str, Any]] = {}
+
+            async def ensure_asset(creative: Creative) -> dict[str, Any]:
+                # First check the creative's own persisted cache.
+                cached_full = creative.get_account_assets()
+                key = norm_acc if not norm_acc.startswith("act_") else norm_acc[4:]
+                act_key = f"act_{key}"
+                got = account_assets_cache.get(creative.id)
+                if got:
+                    return got
+                got = dict(cached_full.get(act_key, {}))
+                if creative.media_type == "image" and got.get("image_hash"):
+                    account_assets_cache[creative.id] = got
+                    return got
+                if creative.media_type == "video" and got.get("video_id"):
+                    account_assets_cache[creative.id] = got
+                    return got
+
+                media_path = settings.uploads_dir / creative.media_filename
+                if not media_path.exists():
+                    raise FbApiError(
+                        code=None,
+                        message=f"local media file missing for creative #{creative.id}",
+                    )
+                content = media_path.read_bytes()
+                mime = creative.media_mime or "application/octet-stream"
+                fname = creative.media_filename
+                if creative.media_type == "image":
+                    h = await client.upload_image(
+                        norm_acc, filename=fname, content=content, mime=mime
+                    )
+                    got["image_hash"] = h
+                else:
+                    vid = await client.upload_video(
+                        norm_acc, filename=fname, content=content, mime=mime
+                    )
+                    got["video_id"] = vid
+                account_assets_cache[creative.id] = got
+                # Persist to DB so future runs reuse.
+                full = creative.get_account_assets()
+                full[act_key] = got
+                creative.set_account_assets(full)
+                return got
+
+            # Build targeting once.
+            targeting = cfg.adset.targeting.model_dump()
+            fb_targeting: dict[str, Any] = {
+                "geo_locations": {"countries": targeting.get("countries") or []},
+                "age_min": targeting.get("age_min", 18),
+                "age_max": targeting.get("age_max", 65),
+            }
+            if targeting.get("genders"):
+                fb_targeting["genders"] = targeting["genders"]
+            if targeting.get("locales"):
+                fb_targeting["locales"] = targeting["locales"]
+            if targeting.get("publisher_platforms"):
+                fb_targeting["publisher_platforms"] = targeting["publisher_platforms"]
+
+            promoted_object = None
+            if cfg.adset.promoted_object:
+                po = cfg.adset.promoted_object.model_dump(exclude_none=True)
+                if po:
+                    promoted_object = po
+
+            campaigns_out: list[CampaignResultV2] = []
+            flat_ad_idx = 0
+
+            for ci in range(1, request.topology.n_campaigns + 1):
+                camp_name = _format_name(
+                    request.campaign_name_pattern,
+                    "{tpl} — {account}" + (f" #{ci}" if request.topology.n_campaigns > 1 else ""),
+                    tpl=template.name,
+                    account=account_label,
+                    c=ci,
+                    a=0,
+                    k=0,
+                )
+                try:
+                    camp = await client.create_campaign(
+                        norm_acc,
+                        name=camp_name,
+                        objective=cfg.campaign.objective,
+                        status=cfg.campaign.status,
+                        special_ad_categories=cfg.campaign.special_ad_categories,
+                        buying_type=cfg.campaign.buying_type,
+                        daily_budget_cents=_to_cents(cfg.campaign.daily_budget),
+                        lifetime_budget_cents=_to_cents(cfg.campaign.lifetime_budget),
+                        bid_strategy=cfg.campaign.bid_strategy,
+                    )
+                    campaign_id = str(camp.get("id") or "")
+                    if not campaign_id:
+                        raise FbApiError(code=None, message="no campaign id returned")
+                    async with summary_lock:
+                        summary["campaigns_ok"] += 1
+                except FbApiError as exc:
+                    async with summary_lock:
+                        summary["campaigns_failed"] += 1
+                    campaigns_out.append(
+                        CampaignResultV2(name=camp_name, error=f"campaign create failed: {exc}")
+                    )
+                    continue
+
+                campaign_result = CampaignResultV2(name=camp_name, campaign_id=campaign_id)
+                campaigns_out.append(campaign_result)
+
+                for ai in range(1, request.topology.n_adsets_per_campaign + 1):
+                    adset_name = _format_name(
+                        request.adset_name_pattern,
+                        "{tpl} adset" + (f" #{ai}" if request.topology.n_adsets_per_campaign > 1 else ""),
+                        tpl=template.name,
+                        account=account_label,
+                        c=ci,
+                        a=ai,
+                        k=0,
+                    )
+                    try:
+                        ads_obj = await client.create_adset(
+                            norm_acc,
+                            name=adset_name,
+                            campaign_id=campaign_id,
+                            optimization_goal=cfg.adset.optimization_goal,
+                            billing_event=cfg.adset.billing_event,
+                            status=cfg.adset.status,
+                            targeting=fb_targeting,
+                            daily_budget_cents=_to_cents(cfg.adset.daily_budget),
+                            lifetime_budget_cents=_to_cents(cfg.adset.lifetime_budget),
+                            bid_amount_cents=_to_cents(cfg.adset.bid_amount),
+                            promoted_object=promoted_object,
+                            destination_type=cfg.adset.destination_type,
+                            start_time=cfg.adset.start_time,
+                            end_time=cfg.adset.end_time,
+                            dsa_beneficiary=cfg.adset.dsa_beneficiary,
+                            dsa_payor=cfg.adset.dsa_payor,
+                        )
+                        adset_id = str(ads_obj.get("id") or "")
+                        if not adset_id:
+                            raise FbApiError(code=None, message="no adset id returned")
+                        async with summary_lock:
+                            summary["adsets_ok"] += 1
+                    except FbApiError as exc:
+                        async with summary_lock:
+                            summary["adsets_failed"] += 1
+                        # advance flat_ad_idx anyway so creative round-robin stays stable
+                        flat_ad_idx += request.topology.n_ads_per_adset
+                        campaign_result.adsets.append(
+                            AdSetResultV2(name=adset_name, error=f"adset create failed: {exc}")
+                        )
+                        continue
+
+                    adset_result = AdSetResultV2(name=adset_name, adset_id=adset_id)
+                    campaign_result.adsets.append(adset_result)
+
+                    for ki in range(1, request.topology.n_ads_per_adset + 1):
+                        cidx = _pick_creative_index(
+                            request.distribution, flat_ad_idx, total_ads_per_account
+                        )
+                        flat_ad_idx += 1
+                        if cidx is None:
+                            continue
+                        creative_local_id = request.distribution.creative_ids[cidx]
+                        creative = creatives_by_id.get(creative_local_id)
+                        if not creative:
+                            adset_result.ads.append(
+                                AdResultV2(
+                                    name=f"ad #{ki}",
+                                    creative_id=creative_local_id,
+                                    error="creative missing",
+                                )
+                            )
+                            async with summary_lock:
+                                summary["ads_failed"] += 1
+                            continue
+
+                        ad_name = _format_name(
+                            request.ad_name_pattern,
+                            "{tpl} ad" + (f" #{ki}" if request.topology.n_ads_per_adset > 1 else ""),
+                            tpl=template.name,
+                            account=account_label,
+                            c=ci,
+                            a=ai,
+                            k=ki,
+                        )
+                        try:
+                            asset = await ensure_asset(creative)
+                            cr = await client.create_ad_creative(
+                                norm_acc,
+                                name=creative.name,
+                                page_id=page_id or creative.page_id or "",
+                                link_url=creative.link_url or "",
+                                message=creative.body,
+                                headline=creative.title,
+                                description=creative.description,
+                                cta_type=creative.cta_type,
+                                image_hash=asset.get("image_hash"),
+                                video_id=asset.get("video_id"),
+                                instagram_actor_id=creative.instagram_actor_id,
+                            )
+                            fb_cr_id = str(cr.get("id") or "")
+                            if not fb_cr_id:
+                                raise FbApiError(code=None, message="no creative id returned")
+                            ad = await client.create_ad(
+                                norm_acc,
+                                name=ad_name,
+                                adset_id=adset_id,
+                                creative_id=fb_cr_id,
+                                status=request.ad_status,
+                            )
+                            ad_id = str(ad.get("id") or "")
+                            adset_result.ads.append(
+                                AdResultV2(
+                                    name=ad_name,
+                                    creative_id=creative_local_id,
+                                    fb_creative_id=fb_cr_id,
+                                    ad_id=ad_id or None,
+                                )
+                            )
+                            async with summary_lock:
+                                summary["ads_ok"] += 1
+                        except FbApiError as exc:
+                            adset_result.ads.append(
+                                AdResultV2(
+                                    name=ad_name,
+                                    creative_id=creative_local_id,
+                                    error=f"ad create failed: {exc}",
+                                )
+                            )
+                            async with summary_lock:
+                                summary["ads_failed"] += 1
+
+            # Persist any new asset cache entries to DB.
+            db.commit()
+
+            top_ok = any(c.campaign_id for c in campaigns_out)
+            return LaunchResultV2(
+                token_id=target.token_id,
+                account_id=norm_acc,
+                ok=top_ok,
+                campaigns=campaigns_out,
+            )
+
+    results = await asyncio.gather(*(one(t) for t in request.targets))
+
+    # Audit log
+    for r in results:
+        for camp in r.campaigns:
+            db.add(
+                BulkActionLog(
+                    action="launch_v2",
+                    level="campaign",
+                    token_id=r.token_id,
+                    account_id=r.account_id,
+                    object_id=camp.campaign_id or "-",
+                    result="ok" if camp.campaign_id else "error",
+                    error=camp.error,
+                )
+            )
+    db.commit()
+
+    return LaunchResponseV2(results=list(results), summary=summary)
