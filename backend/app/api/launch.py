@@ -23,10 +23,15 @@ from app.models.fb_token import FbToken
 from app.models.launch_template import LaunchTemplate
 from app.models.user import User
 from app.schemas.launch import (
+    AccountHealth,
+    AccountHealthRequest,
+    AccountHealthResponse,
     AccountTarget,
     LaunchRequest,
     LaunchResponse,
     LaunchResult,
+    PageInfo,
+    PixelInfo,
     PreviewResponse,
     PreviewRow,
     TemplateConfig,
@@ -127,6 +132,98 @@ def delete_template(
         db.delete(t)
         db.commit()
     return {"ok": True}
+
+
+# ===================================================================
+#                          Account health
+# ===================================================================
+
+
+@router.post("/account_health", response_model=AccountHealthResponse)
+async def account_health(
+    request: AccountHealthRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> AccountHealthResponse:
+    """Inspect each (token, ad-account) for Pixels and Pages.
+
+    The launcher uses this to:
+      * pre-fill a pixel dropdown (instead of asking the user to type
+        a 16-digit pixel_id by hand);
+      * block Sales / Leads templates on accounts with zero pixels
+        BEFORE we hit the FB API and get a confusing error.
+    """
+    if not request.targets:
+        return AccountHealthResponse(accounts=[])
+
+    token_ids = {t.token_id for t in request.targets}
+    tokens = _resolve_tokens(db, token_ids)
+
+    # ad_account_id -> human metadata (name etc.)
+    meta_per_token: dict[int, dict[str, dict[str, Any]]] = {}
+    meta_results = await asyncio.gather(
+        *(_account_meta(tokens[tid]) for tid in tokens),
+        return_exceptions=True,
+    )
+    for tid, m in zip(tokens.keys(), meta_results):
+        meta_per_token[tid] = m if isinstance(m, dict) else {}
+
+    sem = asyncio.Semaphore(LAUNCH_CONCURRENCY)
+
+    async def fetch(target: AccountTarget) -> AccountHealth:
+        token = tokens.get(target.token_id)
+        if not token:
+            return AccountHealth(
+                token_id=target.token_id,
+                account_id=target.account_id,
+                has_pixel=False,
+                has_page=False,
+                error="token not found or disabled",
+            )
+        async with sem:
+            client = FbClient(token.access_token, proxy_url=token.proxy_url)
+            try:
+                pixels_raw, pages_raw = await asyncio.gather(
+                    client.pixels(target.account_id),
+                    client.promote_pages(target.account_id),
+                )
+            except FbApiError as exc:
+                return AccountHealth(
+                    token_id=target.token_id,
+                    account_id=target.account_id,
+                    has_pixel=False,
+                    has_page=False,
+                    error=str(exc),
+                )
+
+        pixels = [
+            PixelInfo(
+                id=str(p.get("id")),
+                name=p.get("name"),
+                is_unavailable=bool(p.get("is_unavailable")),
+                last_fired_time=p.get("last_fired_time"),
+            )
+            for p in pixels_raw
+            if p.get("id")
+        ]
+        pages = [
+            PageInfo(id=str(p.get("id")), name=p.get("name"))
+            for p in pages_raw
+            if p.get("id")
+        ]
+        meta = meta_per_token.get(target.token_id, {}).get(target.account_id, {})
+        return AccountHealth(
+            token_id=target.token_id,
+            account_id=target.account_id,
+            account_name=meta.get("name"),
+            has_pixel=any(not p.is_unavailable for p in pixels),
+            has_page=bool(pages),
+            pixels=pixels,
+            pages=pages,
+        )
+
+    accounts = await asyncio.gather(*(fetch(t) for t in request.targets))
+    return AccountHealthResponse(accounts=list(accounts))
 
 
 # ===================================================================

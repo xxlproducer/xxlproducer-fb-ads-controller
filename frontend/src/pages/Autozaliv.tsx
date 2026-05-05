@@ -123,6 +123,33 @@ interface LaunchResponse {
   results: LaunchResult[];
 }
 
+interface PixelInfo {
+  id: string;
+  name: string | null;
+  is_unavailable: boolean;
+  last_fired_time: string | null;
+}
+
+interface PageInfo {
+  id: string;
+  name: string | null;
+}
+
+interface AccountHealth {
+  token_id: number;
+  account_id: string;
+  account_name: string | null;
+  has_pixel: boolean;
+  has_page: boolean;
+  pixels: PixelInfo[];
+  pages: PageInfo[];
+  error: string | null;
+}
+
+interface AccountHealthResponse {
+  accounts: AccountHealth[];
+}
+
 // ---------------------------------------------------------------- defaults
 
 const OBJECTIVES = [
@@ -1197,6 +1224,41 @@ function ReviewStep({
     },
   });
 
+  // Fetch the template to know whether a Pixel is required.
+  const tplQuery = useQuery({
+    queryKey: ["launch-template", templateId],
+    queryFn: async (): Promise<Template> => {
+      const r = await api.get(`/launch/templates/${templateId}`);
+      return r.data;
+    },
+  });
+
+  // Pre-flight: pull pixels + pages per account, gate Sales/Leads on
+  // accounts that have no Pixel (FB returns wildly misleading errors).
+  const healthQuery = useQuery({
+    queryKey: ["launch-account-health", targets],
+    queryFn: async (): Promise<AccountHealthResponse> => {
+      const r = await api.post("/launch/account_health", { targets });
+      return r.data;
+    },
+  });
+
+  const requiresPixel =
+    tplQuery.data?.config?.adset?.optimization_goal === "OFFSITE_CONVERSIONS" ||
+    tplQuery.data?.config?.adset?.optimization_goal === "VALUE" ||
+    tplQuery.data?.config?.campaign?.objective === "OUTCOME_SALES" ||
+    tplQuery.data?.config?.campaign?.objective === "OUTCOME_LEADS";
+
+  const accountsMissingPixel =
+    requiresPixel && healthQuery.data
+      ? healthQuery.data.accounts.filter((a) => !a.has_pixel && !a.error)
+      : [];
+  const accountsErrored = healthQuery.data
+    ? healthQuery.data.accounts.filter((a) => a.error)
+    : [];
+  const blockingPreflight =
+    requiresPixel && accountsMissingPixel.length > 0 && !healthQuery.isLoading;
+
   const [launchResult, setLaunchResult] = useState<LaunchResponse | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
 
@@ -1242,6 +1304,81 @@ function ReviewStep({
           <ul className="mt-1 list-disc pl-5 text-amber-700 dark:text-amber-300">
             {previewQuery.data.warnings.map((w, i) => (
               <li key={i}>{w}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {healthQuery.isLoading && (
+        <div className="flex items-center gap-2 text-xs text-ink-500">
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          Checking pixels & pages on every account…
+        </div>
+      )}
+
+      {blockingPreflight && (
+        <div className="rounded-xl border border-rose-300 bg-rose-50 p-4 text-sm dark:border-rose-700 dark:bg-rose-900/20">
+          <div className="flex items-center gap-2 font-semibold text-rose-700 dark:text-rose-300">
+            <AlertTriangle className="h-4 w-4" />
+            Cannot launch — {accountsMissingPixel.length} account(s) have no FB
+            Pixel
+          </div>
+          <p className="mt-1 text-rose-700 dark:text-rose-300">
+            Your template optimises on{" "}
+            <code>
+              {tplQuery.data?.config?.adset?.optimization_goal ?? "conversions"}
+            </code>
+            , which requires a Pixel attached to the ad account. The accounts
+            below have none, so FB will reject the AdSet (often with a
+            misleading "objective incompatible" error).
+          </p>
+          <ul className="mt-2 list-disc pl-5 text-xs text-rose-700 dark:text-rose-300">
+            {accountsMissingPixel.map((a) => (
+              <li key={`${a.token_id}:${a.account_id}`}>
+                <span className="font-medium">
+                  {a.account_name || `act_${a.account_id}`}
+                </span>{" "}
+                <span className="font-mono text-[11px]">
+                  (act_{a.account_id})
+                </span>
+              </li>
+            ))}
+          </ul>
+          <div className="mt-3 flex flex-wrap gap-2 text-xs">
+            <a
+              href="https://business.facebook.com/events_manager2/list/dataset"
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1 rounded-md bg-rose-600 px-3 py-1.5 font-medium text-white hover:bg-rose-700"
+            >
+              Open Events Manager → create Pixel
+            </a>
+            <Button
+              variant="secondary"
+              onClick={() => healthQuery.refetch()}
+              loading={healthQuery.isFetching}
+            >
+              Re-check
+            </Button>
+            <Button variant="secondary" onClick={onBack}>
+              Edit template (switch to Traffic / LINK_CLICKS)
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {accountsErrored.length > 0 && (
+        <div className="rounded-xl border border-amber-300/50 bg-amber-50 p-3 text-xs dark:border-amber-700/50 dark:bg-amber-900/20">
+          <div className="flex items-center gap-2 font-medium text-amber-700 dark:text-amber-300">
+            <AlertTriangle className="h-3.5 w-3.5" />
+            Could not pre-check {accountsErrored.length} account(s)
+          </div>
+          <ul className="mt-1 list-disc pl-5 text-amber-700 dark:text-amber-300">
+            {accountsErrored.map((a) => (
+              <li key={`${a.token_id}:${a.account_id}`}>
+                <span className="font-mono">act_{a.account_id}</span> —{" "}
+                {a.error}
+              </li>
             ))}
           </ul>
         </div>
@@ -1297,7 +1434,16 @@ function ReviewStep({
         </Button>
         <Button
           onClick={() => setConfirmOpen(true)}
-          disabled={!previewQuery.data || previewQuery.data.plan.length === 0}
+          disabled={
+            !previewQuery.data ||
+            previewQuery.data.plan.length === 0 ||
+            blockingPreflight
+          }
+          title={
+            blockingPreflight
+              ? "Fix the missing-pixel issue above first"
+              : undefined
+          }
         >
           <Rocket className="h-4 w-4" />
           Launch on {targets.length} account{targets.length > 1 ? "s" : ""}

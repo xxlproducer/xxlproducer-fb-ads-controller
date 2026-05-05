@@ -139,3 +139,44 @@ class LaunchResult(BaseModel):
 
 class LaunchResponse(BaseModel):
     results: list[LaunchResult]
+
+
+# --- account health (pixels + pages) ---------------------------------------
+
+
+class PixelInfo(BaseModel):
+    id: str
+    name: str | None = None
+    is_unavailable: bool = False
+    last_fired_time: str | None = None
+
+
+class PageInfo(BaseModel):
+    id: str
+    name: str | None = None
+
+
+class AccountHealth(BaseModel):
+    """What we tell the UI about a single (token, ad-account) target.
+
+    Used by Step 2 / 3 of the launch wizard to gate the Sales / Leads
+    presets on accounts that don't have a Pixel yet (FB error messages
+    for that case are notoriously misleading).
+    """
+
+    token_id: int
+    account_id: str
+    account_name: str | None = None
+    has_pixel: bool
+    has_page: bool
+    pixels: list[PixelInfo] = Field(default_factory=list)
+    pages: list[PageInfo] = Field(default_factory=list)
+    error: str | None = None
+
+
+class AccountHealthRequest(BaseModel):
+    targets: list[AccountTarget]
+
+
+class AccountHealthResponse(BaseModel):
+    accounts: list[AccountHealth]

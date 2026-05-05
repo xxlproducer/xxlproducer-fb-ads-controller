@@ -298,6 +298,47 @@ class FbClient:
         }
         return await self._paginate(f"{acc}/ads", params)
 
+    # ----------------------------------------------------------- account health (pixels / pages)
+
+    async def pixels(self, account_id: str) -> list[dict[str, Any]]:
+        """List FB Pixels attached to an ad account.
+
+        Used by the launcher to (a) populate a dropdown so users don't paste
+        a wrong pixel_id, and (b) refuse Sales / Leads templates on accounts
+        with zero pixels (FB returns confusing errors otherwise).
+        """
+        acc = account_id if account_id.startswith("act_") else f"act_{account_id}"
+        params = {
+            "fields": "id,name,is_unavailable,last_fired_time",
+            "limit": 100,
+        }
+        try:
+            return await self._paginate(f"{acc}/adspixels", params)
+        except FbApiError:
+            return []
+
+    async def promote_pages(self, account_id: str) -> list[dict[str, Any]]:
+        """List FB Pages this ad account is allowed to promote.
+
+        Empty list usually means the user must connect a Page in
+        Business Manager before any Ad creation will succeed.
+        """
+        acc = account_id if account_id.startswith("act_") else f"act_{account_id}"
+        params = {"fields": "id,name", "limit": 100}
+        try:
+            return await self._paginate(f"{acc}/promote_pages", params)
+        except FbApiError:
+            return []
+
+    async def custom_conversions(self, account_id: str) -> list[dict[str, Any]]:
+        """List custom conversions on an ad account."""
+        acc = account_id if account_id.startswith("act_") else f"act_{account_id}"
+        params = {"fields": "id,name,custom_event_type", "limit": 100}
+        try:
+            return await self._paginate(f"{acc}/customconversions", params)
+        except FbApiError:
+            return []
+
     # ----------------------------------------------------------- mutations
 
     async def update_status(self, object_id: str, status: str) -> dict[str, Any]:
