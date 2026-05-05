@@ -33,7 +33,11 @@ if not exist "%SRC%" (
 )
 
 echo Copying new files (preserving venv, node_modules, database)...
-robocopy "%SRC%" "%~dp0" /MIR /NFL /NDL /NJH /NJS /NC /NS /XD ".venv" "node_modules" "data" "__pycache__" ".git" /XF "*.db" "*.sqlite" "*.sqlite3" ".env"
+REM %~dp0 ends with a trailing backslash which breaks robocopy quoting
+REM (robocopy treats \" as an escaped quote). Strip it before passing.
+set "DEST=%~dp0"
+if "%DEST:~-1%"=="\" set "DEST=%DEST:~0,-1%"
+robocopy "%SRC%" "%DEST%" /MIR /NFL /NDL /NJH /NJS /NC /NS /XD ".venv" "node_modules" "data" "__pycache__" ".git" /XF "*.db" "*.sqlite" "*.sqlite3" ".env"
 
 REM robocopy returns 0-7 for success, 8+ for errors
 if errorlevel 8 (
