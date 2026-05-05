@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -24,8 +24,19 @@ import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------- types
 
+interface GeoEntry {
+  key: string;
+  type: string; // "country" | "country_group" | "region" | "city" | "zip"
+  name: string | null;
+  country_code: string | null;
+  country_name: string | null;
+  region: string | null;
+  region_id: number | null;
+}
+
 interface Targeting {
   countries: string[];
+  geo_locations_picked: GeoEntry[];
   age_min: number;
   age_max: number;
   genders: number[]; // [] = all, [1]=male, [2]=female
@@ -449,7 +460,18 @@ function defaultConfig(): TemplateConfig {
       lifetime_budget: null,
       bid_amount: null,
       targeting: {
-        countries: ["PL"],
+        countries: [],
+        geo_locations_picked: [
+          {
+            key: "PL",
+            type: "country",
+            name: "Poland",
+            country_code: "PL",
+            country_name: "Poland",
+            region: null,
+            region_id: null,
+          },
+        ],
         age_min: 18,
         age_max: 65,
         genders: [],
@@ -498,6 +520,8 @@ export function Autozaliv() {
   });
   // "{token_id}:{account_id}" -> page_id
   const [pagePerAccount, setPagePerAccount] = useState<Record<string, string>>({});
+  // "{token_id}:{account_id}" -> pixel_id (for SALES / LEADS)
+  const [pixelPerAccount, setPixelPerAccount] = useState<Record<string, string>>({});
 
   return (
     <Layout
@@ -524,6 +548,7 @@ export function Autozaliv() {
       )}
       {step === "topology" && selectedTemplateId !== null && (
         <TopologyStep
+          templateId={selectedTemplateId}
           selected={selectedAccounts}
           topology={topology}
           setTopology={setTopology}
@@ -531,6 +556,8 @@ export function Autozaliv() {
           setDistribution={setDistribution}
           pagePerAccount={pagePerAccount}
           setPagePerAccount={setPagePerAccount}
+          pixelPerAccount={pixelPerAccount}
+          setPixelPerAccount={setPixelPerAccount}
           onBack={() => setStep("accounts")}
           onNext={() => setStep("review")}
         />
@@ -542,6 +569,7 @@ export function Autozaliv() {
           topology={topology}
           distribution={distribution}
           pagePerAccount={pagePerAccount}
+          pixelPerAccount={pixelPerAccount}
           onBack={() => setStep("topology")}
         />
       )}
@@ -692,7 +720,22 @@ function TemplateStep({
                     <Chip>adset {t.config.adset.daily_budget}/day</Chip>
                   )}
                   <Chip>
-                    {t.config.adset.targeting.countries.join("/") || "no geo"}{" "}
+                    {(() => {
+                      const picked =
+                        t.config.adset.targeting.geo_locations_picked ?? [];
+                      if (picked.length > 0) {
+                        const labels = picked
+                          .slice(0, 3)
+                          .map((g) => g.name || g.key);
+                        return picked.length > 3
+                          ? `${labels.join("/")} +${picked.length - 3}`
+                          : labels.join("/");
+                      }
+                      return (
+                        t.config.adset.targeting.countries.join("/") ||
+                        "no geo"
+                      );
+                    })()}{" "}
                     {t.config.adset.targeting.age_min}-{t.config.adset.targeting.age_max}
                   </Chip>
                 </div>
@@ -735,6 +778,365 @@ function Chip({ children }: { children: React.ReactNode }) {
 
 // ---------------------------------------------------------------- template form
 
+// ---------------------------------------------------------------- GeoPicker
+
+function geoLabel(g: GeoEntry): string {
+  if (g.type === "country" || g.type === "country_group") {
+    return g.name || g.key;
+  }
+  // region/city — append country for disambiguation ("Warsaw, Poland")
+  const place = g.name || g.key;
+  if (g.country_name && g.country_name !== place) {
+    return `${place}, ${g.country_name}`;
+  }
+  return place;
+}
+
+function geoIcon(type: string): string {
+  switch (type) {
+    case "country":
+      return "🌐";
+    case "country_group":
+      return "🌍";
+    case "region":
+      return "🗺️";
+    case "city":
+      return "🏙️";
+    case "zip":
+      return "📮";
+    default:
+      return "📍";
+  }
+}
+
+function GeoPicker({
+  value,
+  onChange,
+}: {
+  value: GeoEntry[];
+  onChange: (v: GeoEntry[]) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [bulkText, setBulkText] = useState("");
+  const [bulkResolving, setBulkResolving] = useState(false);
+
+  const searchQuery = useQuery({
+    queryKey: ["search_geo", query],
+    queryFn: async (): Promise<GeoEntry[]> => {
+      if (query.trim().length < 2) return [];
+      const r = await api.get("/launch/search_geo", {
+        params: { q: query.trim() },
+      });
+      return r.data?.data ?? [];
+    },
+    enabled: query.trim().length >= 2,
+    staleTime: 60_000,
+  });
+
+  // Debounce input → query
+  const [rawQuery, setRawQuery] = useState("");
+  useEffect(() => {
+    const t = setTimeout(() => setQuery(rawQuery), 250);
+    return () => clearTimeout(t);
+  }, [rawQuery]);
+
+  const add = (g: GeoEntry) => {
+    if (value.some((v) => v.key === g.key && v.type === g.type)) return;
+    onChange([...value, g]);
+  };
+  const remove = (g: GeoEntry) =>
+    onChange(value.filter((v) => !(v.key === g.key && v.type === g.type)));
+
+  const runBulkAdd = async () => {
+    const lines = bulkText
+      .split(/[\n,;]/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (lines.length === 0) return;
+    setBulkResolving(true);
+    const added: GeoEntry[] = [];
+    const failed: string[] = [];
+    try {
+      for (const line of lines) {
+        try {
+          const r = await api.get("/launch/search_geo", {
+            params: { q: line },
+          });
+          const rows: GeoEntry[] = r.data?.data ?? [];
+          // Prefer exact ISO/key match, then exact-name match, then first.
+          const upper = line.toUpperCase();
+          const exact =
+            rows.find((row) => row.key?.toUpperCase() === upper) ||
+            rows.find(
+              (row) =>
+                (row.name || "").toLowerCase() === line.toLowerCase(),
+            ) ||
+            rows[0];
+          if (exact) {
+            added.push(exact);
+          } else {
+            failed.push(line);
+          }
+        } catch {
+          failed.push(line);
+        }
+      }
+      // Dedupe vs current value.
+      const seen = new Set(value.map((v) => `${v.type}:${v.key}`));
+      const dedup = added.filter((g) => {
+        const k = `${g.type}:${g.key}`;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+      onChange([...value, ...dedup]);
+      if (failed.length > 0) {
+        toast.error(`Couldn't resolve: ${failed.slice(0, 5).join(", ")}${failed.length > 5 ? "…" : ""}`);
+      } else {
+        toast.success(`Added ${dedup.length} location${dedup.length === 1 ? "" : "s"}`);
+      }
+      setBulkText("");
+      setBulkOpen(false);
+    } finally {
+      setBulkResolving(false);
+    }
+  };
+
+  return (
+    <div className="space-y-2">
+      <label className="text-xs font-medium text-ink-600 dark:text-ink-300">
+        Locations
+      </label>
+
+      {/* Selected pills */}
+      {value.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          {value.map((g) => (
+            <span
+              key={`${g.type}:${g.key}`}
+              className="inline-flex items-center gap-1 rounded-full bg-accent/10 px-2 py-1 text-xs text-accent dark:bg-accent/20"
+            >
+              <span>{geoIcon(g.type)}</span>
+              <span>{geoLabel(g)}</span>
+              <button
+                type="button"
+                onClick={() => remove(g)}
+                className="ml-0.5 rounded-full p-0.5 hover:bg-accent/20"
+                aria-label={`Remove ${geoLabel(g)}`}
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* Search input */}
+      <div className="relative">
+        <input
+          type="text"
+          value={rawQuery}
+          onChange={(e) => {
+            setRawQuery(e.target.value);
+            setOpen(true);
+          }}
+          onFocus={() => setOpen(true)}
+          onBlur={() => setTimeout(() => setOpen(false), 150)}
+          placeholder="Search countries, regions, cities…"
+          className="w-full rounded-md border border-ink-200 bg-white px-3 py-2 text-sm dark:border-ink-700 dark:bg-ink-800"
+        />
+        {open && rawQuery.trim().length >= 2 && (
+          <div className="absolute left-0 right-0 top-full z-10 mt-1 max-h-72 overflow-y-auto rounded-lg border border-ink-200 bg-white shadow-lg dark:border-ink-700 dark:bg-ink-800">
+            {searchQuery.isLoading && (
+              <div className="px-3 py-2 text-xs text-ink-500">
+                <Loader2 className="mr-1 inline h-3 w-3 animate-spin" />
+                Searching…
+              </div>
+            )}
+            {!searchQuery.isLoading &&
+              searchQuery.data &&
+              searchQuery.data.length === 0 && (
+                <div className="px-3 py-2 text-xs text-ink-500">
+                  No matches.
+                </div>
+              )}
+            {searchQuery.data?.map((g) => {
+              const already = value.some(
+                (v) => v.key === g.key && v.type === g.type,
+              );
+              return (
+                <button
+                  key={`${g.type}:${g.key}`}
+                  type="button"
+                  disabled={already}
+                  onClick={() => {
+                    add(g);
+                    setRawQuery("");
+                    setOpen(false);
+                  }}
+                  className={cn(
+                    "flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors",
+                    already
+                      ? "bg-ink-50 text-ink-400 dark:bg-ink-700/40"
+                      : "hover:bg-ink-50 dark:hover:bg-ink-700",
+                  )}
+                >
+                  <span>{geoIcon(g.type)}</span>
+                  <span className="flex-1">{geoLabel(g)}</span>
+                  <span className="text-[10px] uppercase tracking-wider text-ink-400">
+                    {g.type}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      <div className="flex flex-wrap gap-2 text-xs">
+        <button
+          type="button"
+          onClick={() => setBulkOpen((o) => !o)}
+          className="rounded-md border border-ink-200 px-2 py-1 hover:bg-ink-50 dark:border-ink-700 dark:hover:bg-ink-800"
+        >
+          {bulkOpen ? "Hide bulk add" : "Bulk add (paste many)"}
+        </button>
+        {value.length > 0 && (
+          <button
+            type="button"
+            onClick={() => onChange([])}
+            className="rounded-md border border-ink-200 px-2 py-1 text-rose-600 hover:bg-rose-50 dark:border-ink-700 dark:hover:bg-rose-900/20"
+          >
+            Clear all
+          </button>
+        )}
+      </div>
+
+      {bulkOpen && (
+        <div className="rounded-lg border border-ink-200 bg-ink-50 p-3 dark:border-ink-700 dark:bg-ink-800/30">
+          <p className="mb-1 text-[11px] text-ink-500">
+            Paste country codes or names — one per line, or comma-separated.
+            Each line is resolved through FB so wrong/ambiguous entries are
+            flagged.
+          </p>
+          <textarea
+            value={bulkText}
+            onChange={(e) => setBulkText(e.target.value)}
+            placeholder={"PL\nUA\nDE\nUnited States\nGermany"}
+            rows={4}
+            className="w-full rounded-md border border-ink-200 bg-white px-2 py-1 font-mono text-xs dark:border-ink-700 dark:bg-ink-800"
+          />
+          <div className="mt-2 flex justify-end">
+            <Button
+              size="sm"
+              onClick={runBulkAdd}
+              loading={bulkResolving}
+              disabled={!bulkText.trim()}
+            >
+              Resolve & add
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ---------------------------------------------------------------- InlineCreativeUpload
+
+function InlineCreativeUpload({
+  onUploaded,
+}: {
+  onUploaded: (c: CreativeLite) => void;
+}) {
+  const [drag, setDrag] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  const upload = async (files: FileList | File[]) => {
+    const list = Array.from(files);
+    if (list.length === 0) return;
+    setBusy(true);
+    try {
+      for (const f of list) {
+        const fd = new FormData();
+        // Use the filename (sans extension) as the creative name; user can
+        // rename later in /creatives if they want.
+        const baseName = f.name.replace(/\.[^.]+$/, "") || "Untitled";
+        fd.append("name", baseName);
+        fd.append("media", f);
+        try {
+          const r = await api.post("/creatives", fd, {
+            headers: { "Content-Type": "multipart/form-data" },
+          });
+          const created: CreativeLite = r.data;
+          onUploaded(created);
+        } catch (err) {
+          toast.error(`Upload failed for ${f.name}: ${getApiErrorMessage(err)}`);
+        }
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      onDragOver={(e) => {
+        e.preventDefault();
+        setDrag(true);
+      }}
+      onDragLeave={() => setDrag(false)}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDrag(false);
+        if (e.dataTransfer.files.length > 0) upload(e.dataTransfer.files);
+      }}
+      className={cn(
+        "mb-3 flex flex-col items-center justify-center gap-1 rounded-xl border-2 border-dashed px-4 py-5 text-center text-sm transition-all",
+        drag
+          ? "border-accent bg-accent/5"
+          : "border-ink-200 dark:border-ink-700",
+        busy && "opacity-60",
+      )}
+    >
+      <input
+        ref={inputRef}
+        type="file"
+        accept="image/*,video/*"
+        multiple
+        hidden
+        onChange={(e) => {
+          if (e.target.files) upload(e.target.files);
+          e.currentTarget.value = "";
+        }}
+      />
+      <p className="font-medium">
+        {busy ? "Uploading…" : "Drop creatives here"}
+      </p>
+      <p className="text-xs text-ink-500">
+        images and videos · or{" "}
+        <button
+          type="button"
+          onClick={() => inputRef.current?.click()}
+          disabled={busy}
+          className="underline"
+        >
+          browse files
+        </button>{" "}
+        ·{" "}
+        <a href="/creatives" className="underline">
+          full library →
+        </a>
+      </p>
+    </div>
+  );
+}
+
+
 function TemplateFormModal({
   template,
   onClose,
@@ -746,7 +1148,36 @@ function TemplateFormModal({
 }) {
   const [name, setName] = useState(template?.name ?? "");
   const [description, setDescription] = useState(template?.description ?? "");
-  const [cfg, setCfg] = useState<TemplateConfig>(template?.config ?? defaultConfig());
+  const [cfg, setCfg] = useState<TemplateConfig>(() => {
+    const base = template?.config ?? defaultConfig();
+    // Backwards-compat: synthesize picker entries from legacy `countries`
+    // so old templates render correctly in the picker UI. The user can
+    // refine them (regions/cities) afterwards.
+    const picked = base.adset.targeting.geo_locations_picked;
+    const countries = base.adset.targeting.countries;
+    if ((!picked || picked.length === 0) && countries && countries.length > 0) {
+      const synth: GeoEntry[] = countries.map((code) => ({
+        key: code,
+        type: "country",
+        name: code,
+        country_code: code,
+        country_name: null,
+        region: null,
+        region_id: null,
+      }));
+      return {
+        ...base,
+        adset: {
+          ...base.adset,
+          targeting: {
+            ...base.adset.targeting,
+            geo_locations_picked: synth,
+          },
+        },
+      };
+    }
+    return base;
+  });
 
   const saveMutation = useMutation({
     mutationFn: async () => {
@@ -958,20 +1389,21 @@ function TemplateFormModal({
 
             {/* Targeting */}
             <Section title="Targeting">
-              <div className="grid gap-3 md:grid-cols-2">
-                <Input
-                  label="Countries (ISO codes, comma-separated)"
-                  value={cfg.adset.targeting.countries.join(",")}
-                  onChange={(e) =>
-                    setTargeting({
-                      countries: e.target.value
-                        .split(",")
-                        .map((s) => s.trim().toUpperCase())
-                        .filter(Boolean),
-                    })
-                  }
-                  placeholder="PL,UA,DE"
-                />
+              <GeoPicker
+                value={cfg.adset.targeting.geo_locations_picked}
+                onChange={(v) =>
+                  setTargeting({
+                    geo_locations_picked: v,
+                    // Mirror countries so legacy consumers (preview summary)
+                    // and templates without picker data stay in sync.
+                    countries: v
+                      .filter((g) => g.type === "country")
+                      .map((g) => g.key),
+                  })
+                }
+              />
+
+              <div className="mt-3 grid gap-3 md:grid-cols-2">
                 <div className="grid grid-cols-2 gap-3">
                   <Input
                     label="Age min"
@@ -1279,6 +1711,7 @@ interface CreativeLite {
 }
 
 function TopologyStep({
+  templateId,
   selected,
   topology,
   setTopology,
@@ -1286,9 +1719,12 @@ function TopologyStep({
   setDistribution,
   pagePerAccount,
   setPagePerAccount,
+  pixelPerAccount,
+  setPixelPerAccount,
   onBack,
   onNext,
 }: {
+  templateId: number;
   selected: Set<string>;
   topology: TopologyState;
   setTopology: (t: TopologyState) => void;
@@ -1296,9 +1732,12 @@ function TopologyStep({
   setDistribution: (d: DistributionState) => void;
   pagePerAccount: Record<string, string>;
   setPagePerAccount: (p: Record<string, string>) => void;
+  pixelPerAccount: Record<string, string>;
+  setPixelPerAccount: (p: Record<string, string>) => void;
   onBack: () => void;
   onNext: () => void;
 }) {
+  const queryClient = useQueryClient();
   const targets = useMemo(
     () =>
       Array.from(selected).map((k) => {
@@ -1307,6 +1746,20 @@ function TopologyStep({
       }),
     [selected],
   );
+
+  // Need template config to know whether SALES/LEADS (= pixel required).
+  const templateQuery = useQuery({
+    queryKey: ["launch-template", templateId],
+    queryFn: async (): Promise<Template> => {
+      const r = await api.get(`/launch/templates/${templateId}`);
+      return r.data;
+    },
+  });
+  const objective = templateQuery.data?.config.campaign.objective;
+  const pixelRequired =
+    objective === "OUTCOME_SALES" ||
+    objective === "OUTCOME_LEADS" ||
+    objective === "CONVERSIONS";
 
   const creativesQuery = useQuery({
     queryKey: ["creatives-list-for-launch"],
@@ -1345,6 +1798,19 @@ function TopologyStep({
       })
     : [];
 
+  // Pixel selection — only required when the template's objective demands it
+  // AND the account actually has at least one usable pixel. Accounts with no
+  // pixel are surfaced separately by the pre-flight banner on the review step.
+  const accountsMissingPixel =
+    pixelRequired && healthQuery.data
+      ? healthQuery.data.accounts.filter((a) => {
+          const usable = a.pixels.filter((p) => !p.is_unavailable);
+          if (usable.length === 0) return false; // surfaced elsewhere
+          const key = `${a.token_id}:${a.account_id}`;
+          return !pixelPerAccount[key];
+        })
+      : [];
+
   const canNext =
     targets.length > 0 &&
     topology.n_campaigns >= 1 &&
@@ -1352,7 +1818,8 @@ function TopologyStep({
     (!wantsAds ||
       (distribution.creative_ids.length > 0 &&
         !onePerAdMismatch &&
-        accountsMissingPage.length === 0));
+        accountsMissingPage.length === 0 &&
+        accountsMissingPixel.length === 0));
 
   const toggleCreative = (id: number) => {
     if (distribution.creative_ids.includes(id)) {
@@ -1420,21 +1887,29 @@ function TopologyStep({
       </Section>
 
       {wantsAds && (
-        <Section title="Page (per account)">
+        <Section
+          title={
+            pixelRequired
+              ? "Page & Pixel (per account)"
+              : "Page (per account)"
+          }
+        >
           <p className="-mt-1 mb-3 text-xs text-ink-500">
-            Every Ad needs a Facebook Page. We pulled the Pages each account
-            can promote — pick the right one per account. (FB needs this even
-            for video ads.)
+            Pick the FB Page each account should run ads under
+            {pixelRequired
+              ? " plus the Pixel to track conversions on. Pulled live from each account."
+              : " — pulled live from each account."}
           </p>
           {healthQuery.isLoading && (
             <div className="flex items-center gap-2 text-xs text-ink-500">
               <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              Loading pages…
+              Loading pages and pixels…
             </div>
           )}
           <div className="grid gap-2 md:grid-cols-2">
             {healthQuery.data?.accounts.map((a) => {
               const key = `${a.token_id}:${a.account_id}`;
+              const usablePixels = a.pixels.filter((p) => !p.is_unavailable);
               return (
                 <div
                   key={key}
@@ -1446,9 +1921,14 @@ function TopologyStep({
                   <div className="text-[11px] text-ink-500">
                     act_{a.account_id}
                   </div>
+
+                  {/* Page */}
+                  <div className="mt-2 text-[11px] uppercase tracking-wider text-ink-400">
+                    Page
+                  </div>
                   {a.pages.length === 0 ? (
-                    <div className="mt-1 text-xs text-rose-600">
-                      No promotable Pages on this account.{" "}
+                    <div className="text-xs text-rose-600">
+                      No promotable Pages.{" "}
                       <a
                         href="https://www.facebook.com/business/help/1593627458007959"
                         target="_blank"
@@ -1461,7 +1941,7 @@ function TopologyStep({
                     </div>
                   ) : (
                     <select
-                      className="mt-1 w-full rounded-md border border-ink-200 bg-white px-2 py-1 text-xs dark:border-ink-600 dark:bg-ink-800"
+                      className="w-full rounded-md border border-ink-200 bg-white px-2 py-1 text-xs dark:border-ink-600 dark:bg-ink-800"
                       value={pagePerAccount[key] ?? ""}
                       onChange={(e) =>
                         setPagePerAccount({
@@ -1478,6 +1958,47 @@ function TopologyStep({
                       ))}
                     </select>
                   )}
+
+                  {/* Pixel — only when objective demands it */}
+                  {pixelRequired && (
+                    <>
+                      <div className="mt-2 text-[11px] uppercase tracking-wider text-ink-400">
+                        Pixel
+                      </div>
+                      {usablePixels.length === 0 ? (
+                        <div className="text-xs text-rose-600">
+                          No usable Pixel.{" "}
+                          <a
+                            href={`https://business.facebook.com/events_manager2/list/dataset?act=${a.account_id}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="underline"
+                          >
+                            Create in Events Manager
+                          </a>
+                          .
+                        </div>
+                      ) : (
+                        <select
+                          className="w-full rounded-md border border-ink-200 bg-white px-2 py-1 text-xs dark:border-ink-600 dark:bg-ink-800"
+                          value={pixelPerAccount[key] ?? ""}
+                          onChange={(e) =>
+                            setPixelPerAccount({
+                              ...pixelPerAccount,
+                              [key]: e.target.value,
+                            })
+                          }
+                        >
+                          <option value="">— select pixel —</option>
+                          {usablePixels.map((p) => (
+                            <option key={p.id} value={p.id}>
+                              {p.name || p.id}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                    </>
+                  )}
                 </div>
               );
             })}
@@ -1488,17 +2009,36 @@ function TopologyStep({
               selected.
             </p>
           )}
+          {accountsMissingPixel.length > 0 && (
+            <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">
+              ⚠ {accountsMissingPixel.length} account(s) still need a Pixel
+              selected.
+            </p>
+          )}
         </Section>
       )}
 
       {wantsAds && (
         <Section title="Creatives">
           <p className="-mt-1 mb-3 text-xs text-ink-500">
-            Pick creatives from your library. Need to upload new ones?{" "}
-            <a href="/creatives" className="underline">
-              Open Creative library →
-            </a>
+            Drop image / video files below to add new creatives, or pick from
+            your library. Newly uploaded ones are auto-selected.
           </p>
+
+          <InlineCreativeUpload
+            onUploaded={(c) => {
+              queryClient.invalidateQueries({
+                queryKey: ["creatives-list-for-launch"],
+              });
+              if (!distribution.creative_ids.includes(c.id)) {
+                setDistribution({
+                  ...distribution,
+                  creative_ids: [...distribution.creative_ids, c.id],
+                });
+              }
+            }}
+          />
+
 
           <div className="mb-3 grid gap-2 md:grid-cols-3">
             {(
@@ -1684,6 +2224,7 @@ function ReviewStep({
   topology,
   distribution,
   pagePerAccount,
+  pixelPerAccount,
   onBack,
 }: {
   templateId: number;
@@ -1691,6 +2232,7 @@ function ReviewStep({
   topology: TopologyState;
   distribution: DistributionState;
   pagePerAccount: Record<string, string>;
+  pixelPerAccount: Record<string, string>;
   onBack: () => void;
 }) {
   const targets = useMemo(
@@ -1765,6 +2307,7 @@ function ReviewStep({
         topology,
         distribution: wantsAds ? distribution : null,
         page_id_per_account: wantsAds ? pagePerAccount : {},
+        pixel_id_per_account: pixelPerAccount,
       });
       return r.data;
     },

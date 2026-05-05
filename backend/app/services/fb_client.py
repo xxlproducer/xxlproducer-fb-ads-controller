@@ -339,6 +339,62 @@ class FbClient:
         except FbApiError:
             return []
 
+    # ----------------------------------------------------------- targeting search
+
+    async def search_geo(
+        self,
+        query: str,
+        *,
+        location_types: list[str] | None = None,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        """Search FB targeting geo locations (countries / regions / cities).
+
+        Returns the raw FB rows so callers can keep `key`, `country_code`,
+        `country_name`, `name`, `type`, `region`, `region_id`, `supports_region`
+        etc. and pass them straight back into a targeting spec.
+        """
+        types = location_types or ["country", "country_group", "region", "city"]
+        params: dict[str, Any] = {
+            "type": "adgeolocation",
+            "q": query,
+            "location_types": json.dumps(types),
+            "limit": limit,
+        }
+        try:
+            data = await self._request("GET", "search", params=params)
+        except FbApiError:
+            return []
+        if isinstance(data, dict):
+            return data.get("data", []) or []
+        return []
+
+    async def lookup_geo_by_keys(
+        self,
+        keys: list[str],
+        *,
+        location_types: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Resolve a batch of FB geo keys (e.g. ["US","UA","2421"]) into
+        their full geo-location records — used to render existing
+        targeting back into the picker without dropping data.
+        """
+        if not keys:
+            return []
+        types = location_types or ["country", "country_group", "region", "city"]
+        params: dict[str, Any] = {
+            "type": "adgeolocation",
+            "location_types": json.dumps(types),
+            "keys": json.dumps(keys),
+        }
+        try:
+            data = await self._request("GET", "search", params=params)
+        except FbApiError:
+            return []
+        if isinstance(data, dict):
+            return data.get("data", []) or []
+        return []
+
     # ----------------------------------------------------------- mutations
 
     async def update_status(self, object_id: str, status: str) -> dict[str, Any]:
