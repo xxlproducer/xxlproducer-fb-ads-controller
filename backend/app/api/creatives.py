@@ -220,12 +220,31 @@ def delete_creative(
 @router.get("/{creative_id}/media")
 def serve_media(
     creative_id: int,
+    thumb: int = 0,
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
+    """Serve the creative's media file.
+
+    When `?thumb=1` is passed and a separate thumbnail was uploaded, serve
+    that instead. For images we transparently fall back to the original
+    file so callers don't have to special-case "no thumb".
+    """
     c = db.get(Creative, creative_id)
     if not c:
         raise HTTPException(status_code=404, detail="creative not found")
+
+    if thumb and c.thumbnail_filename:
+        p = settings.uploads_dir / c.thumbnail_filename
+        if p.exists():
+            return FileResponse(str(p), media_type="image/jpeg")
+        # explicit thumbnail missing on disk — keep going and serve original.
+
+    if thumb and c.media_type == "video" and not c.thumbnail_filename:
+        # Video with no thumbnail uploaded — caller should render a
+        # placeholder; we 404 so <img> falls back to alt text or onError.
+        raise HTTPException(status_code=404, detail="no thumbnail")
+
     p = settings.uploads_dir / c.media_filename
     if not p.exists():
         raise HTTPException(status_code=404, detail="media file missing")
