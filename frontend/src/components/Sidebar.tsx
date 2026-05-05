@@ -4,6 +4,7 @@ import {
   KeyRound,
   Layers,
   Rocket,
+  Image as ImageIcon,
   LogOut,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -14,6 +15,7 @@ const items = [
   { to: "/tokens", label: "FB Accounts", icon: KeyRound },
   { to: "/bulk", label: "Bulk Actions", icon: Layers },
   { to: "/launch", label: "Autozaliv", icon: Rocket },
+  { to: "/creatives", label: "Creatives", icon: ImageIcon },
 ];
 
 export function Sidebar() {
