@@ -145,6 +145,10 @@ const OPTIMIZATION_GOALS = [
   "LANDING_PAGE_VIEWS",
   "THRUPLAY",
   "LEAD_GENERATION",
+  "QUALITY_LEAD",
+  "EVENT_RESPONSES",
+  "AD_RECALL_LIFT",
+  "APP_INSTALLS",
 ];
 
 const BILLING_EVENTS = [
@@ -171,10 +175,209 @@ const CUSTOM_EVENT_TYPES = [
   "OTHER",
 ];
 
+/**
+ * Goal presets — pick one and we auto-fill compatible
+ * `objective` + `optimization_goal` + `billing_event` + (optionally)
+ * the promoted_object skeleton, so the user doesn't have to memorize
+ * which combos FB allows.
+ *
+ * Reference compatibility table (FB Marketing API v21):
+ *   OUTCOME_SALES        + OFFSITE_CONVERSIONS / VALUE / LANDING_PAGE_VIEWS
+ *   OUTCOME_LEADS        + LEAD_GENERATION / OFFSITE_CONVERSIONS / QUALITY_LEAD
+ *   OUTCOME_TRAFFIC      + LINK_CLICKS / LANDING_PAGE_VIEWS / REACH / IMPRESSIONS
+ *   OUTCOME_ENGAGEMENT   + POST_ENGAGEMENT / PAGE_LIKES / EVENT_RESPONSES
+ *   OUTCOME_AWARENESS    + REACH / IMPRESSIONS / AD_RECALL_LIFT / THRUPLAY
+ *   OUTCOME_APP_PROMOTION+ APP_INSTALLS / OFFSITE_CONVERSIONS
+ */
+type PresetId =
+  | "sales"
+  | "leads"
+  | "traffic"
+  | "engagement"
+  | "awareness"
+  | "app_installs"
+  | "video_views"
+  | "custom";
+
+interface Preset {
+  id: PresetId;
+  emoji: string;
+  label: string;
+  hint: string;
+  objective: string;
+  optimization_goal: string;
+  billing_event: string;
+  needs_pixel: boolean;
+  default_event_type: string | null;
+}
+
+const PRESETS: Preset[] = [
+  {
+    id: "sales",
+    emoji: "🛒",
+    label: "Sales (Purchases)",
+    hint: "Sales campaigns optimised on Pixel purchases. Most common.",
+    objective: "OUTCOME_SALES",
+    optimization_goal: "OFFSITE_CONVERSIONS",
+    billing_event: "IMPRESSIONS",
+    needs_pixel: true,
+    default_event_type: "PURCHASE",
+  },
+  {
+    id: "leads",
+    emoji: "📥",
+    label: "Leads",
+    hint: "On-site lead form conversions tracked via Pixel.",
+    objective: "OUTCOME_LEADS",
+    optimization_goal: "OFFSITE_CONVERSIONS",
+    billing_event: "IMPRESSIONS",
+    needs_pixel: true,
+    default_event_type: "LEAD",
+  },
+  {
+    id: "traffic",
+    emoji: "🔗",
+    label: "Traffic (Link clicks)",
+    hint: "Just send people to your URL. No pixel needed.",
+    objective: "OUTCOME_TRAFFIC",
+    optimization_goal: "LINK_CLICKS",
+    billing_event: "IMPRESSIONS",
+    needs_pixel: false,
+    default_event_type: null,
+  },
+  {
+    id: "engagement",
+    emoji: "❤️",
+    label: "Engagement",
+    hint: "Likes / reactions / comments / shares.",
+    objective: "OUTCOME_ENGAGEMENT",
+    optimization_goal: "POST_ENGAGEMENT",
+    billing_event: "IMPRESSIONS",
+    needs_pixel: false,
+    default_event_type: null,
+  },
+  {
+    id: "awareness",
+    emoji: "📢",
+    label: "Awareness (Reach)",
+    hint: "Maximise unique impressions in the audience.",
+    objective: "OUTCOME_AWARENESS",
+    optimization_goal: "REACH",
+    billing_event: "IMPRESSIONS",
+    needs_pixel: false,
+    default_event_type: null,
+  },
+  {
+    id: "video_views",
+    emoji: "▶️",
+    label: "Video views",
+    hint: "Optimise for ThruPlays (15s+).",
+    objective: "OUTCOME_AWARENESS",
+    optimization_goal: "THRUPLAY",
+    billing_event: "IMPRESSIONS",
+    needs_pixel: false,
+    default_event_type: null,
+  },
+  {
+    id: "app_installs",
+    emoji: "📱",
+    label: "App installs",
+    hint: "Drive app installs (requires app_id + store_url).",
+    objective: "OUTCOME_APP_PROMOTION",
+    optimization_goal: "APP_INSTALLS",
+    billing_event: "IMPRESSIONS",
+    needs_pixel: false,
+    default_event_type: null,
+  },
+];
+
+/**
+ * Compatibility map: objective -> set of optimization_goals FB accepts.
+ * Used to flag misconfigured templates BEFORE we hit the FB API.
+ * Conservative — extra valid combos aren't blocking, we only warn.
+ */
+const COMPATIBLE_GOALS: Record<string, string[]> = {
+  OUTCOME_SALES: [
+    "OFFSITE_CONVERSIONS",
+    "VALUE",
+    "LANDING_PAGE_VIEWS",
+    "LINK_CLICKS",
+  ],
+  OUTCOME_LEADS: [
+    "LEAD_GENERATION",
+    "OFFSITE_CONVERSIONS",
+    "QUALITY_LEAD",
+    "LANDING_PAGE_VIEWS",
+    "LINK_CLICKS",
+  ],
+  OUTCOME_TRAFFIC: [
+    "LINK_CLICKS",
+    "LANDING_PAGE_VIEWS",
+    "REACH",
+    "IMPRESSIONS",
+  ],
+  OUTCOME_ENGAGEMENT: [
+    "POST_ENGAGEMENT",
+    "PAGE_LIKES",
+    "EVENT_RESPONSES",
+    "REACH",
+    "IMPRESSIONS",
+    "THRUPLAY",
+  ],
+  OUTCOME_AWARENESS: [
+    "REACH",
+    "IMPRESSIONS",
+    "AD_RECALL_LIFT",
+    "THRUPLAY",
+  ],
+  OUTCOME_APP_PROMOTION: ["APP_INSTALLS", "OFFSITE_CONVERSIONS", "LINK_CLICKS"],
+};
+
+function isCompatible(objective: string, optimization_goal: string): boolean {
+  const allowed = COMPATIBLE_GOALS[objective];
+  if (!allowed) return true; // unknown objective — don't block
+  return allowed.includes(optimization_goal);
+}
+
+function detectPresetId(cfg: TemplateConfig): PresetId {
+  for (const p of PRESETS) {
+    if (
+      p.objective === cfg.campaign.objective &&
+      p.optimization_goal === cfg.adset.optimization_goal
+    ) {
+      return p.id;
+    }
+  }
+  return "custom";
+}
+
+function applyPreset(cfg: TemplateConfig, preset: Preset): TemplateConfig {
+  const next = {
+    campaign: {
+      ...cfg.campaign,
+      objective: preset.objective,
+    },
+    adset: {
+      ...cfg.adset,
+      optimization_goal: preset.optimization_goal,
+      billing_event: preset.billing_event,
+    },
+  };
+  if (preset.needs_pixel) {
+    const existing = cfg.adset.promoted_object ?? {};
+    next.adset.promoted_object = {
+      ...existing,
+      custom_event_type:
+        existing.custom_event_type || preset.default_event_type,
+    };
+  }
+  return next;
+}
+
 function defaultConfig(): TemplateConfig {
   return {
     campaign: {
-      objective: "OUTCOME_AWARENESS",
+      objective: "OUTCOME_SALES",
       status: "PAUSED",
       special_ad_categories: [],
       buying_type: "AUCTION",
@@ -183,7 +386,7 @@ function defaultConfig(): TemplateConfig {
       bid_strategy: "LOWEST_COST_WITHOUT_CAP",
     },
     adset: {
-      optimization_goal: "REACH",
+      optimization_goal: "OFFSITE_CONVERSIONS",
       billing_event: "IMPRESSIONS",
       status: "PAUSED",
       daily_budget: null,
@@ -513,6 +716,72 @@ function TemplateFormModal({
                 placeholder="optional"
               />
             </div>
+
+            {/* Goal preset (one click = compatible objective + opt goal) */}
+            <Section title="Goal preset">
+              <p className="-mt-1 mb-2 text-xs text-ink-500">
+                Pick what you actually want. We'll auto-fill the right
+                <code className="mx-1 rounded bg-ink-100 px-1 py-0.5 dark:bg-ink-800">
+                  objective
+                </code>
+                +
+                <code className="mx-1 rounded bg-ink-100 px-1 py-0.5 dark:bg-ink-800">
+                  optimization_goal
+                </code>
+                so FB doesn't reject the combo.
+              </p>
+              <div className="grid gap-2 sm:grid-cols-2 md:grid-cols-3">
+                {PRESETS.map((p) => {
+                  const active = detectPresetId(cfg) === p.id;
+                  return (
+                    <button
+                      key={p.id}
+                      type="button"
+                      onClick={() => setCfg((c) => applyPreset(c, p))}
+                      className={cn(
+                        "flex flex-col items-start gap-1 rounded-xl border px-3 py-2 text-left text-sm transition-all",
+                        active
+                          ? "border-accent bg-accent/10 shadow-sm"
+                          : "border-ink-200 hover:border-ink-300 hover:bg-ink-50 dark:border-ink-700 dark:hover:bg-ink-800",
+                      )}
+                    >
+                      <span className="font-medium">
+                        {p.emoji} {p.label}
+                      </span>
+                      <span className="text-[11px] leading-tight text-ink-500">
+                        {p.hint}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+              {detectPresetId(cfg) === "custom" && (
+                <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">
+                  ⚠ Custom combination — make sure objective and
+                  optimization_goal are compatible (see warning below if any).
+                </p>
+              )}
+            </Section>
+
+            {!isCompatible(
+              cfg.campaign.objective,
+              cfg.adset.optimization_goal,
+            ) && (
+              <div className="flex items-start gap-2 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-200">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                <div>
+                  <strong>FB will likely reject this combo:</strong>{" "}
+                  objective <code>{cfg.campaign.objective}</code> isn't
+                  compatible with optimization_goal{" "}
+                  <code>{cfg.adset.optimization_goal}</code>. Allowed for{" "}
+                  <code>{cfg.campaign.objective}</code>:{" "}
+                  <code>
+                    {(COMPATIBLE_GOALS[cfg.campaign.objective] ?? []).join(", ")}
+                  </code>
+                  .
+                </div>
+              </div>
+            )}
 
             {/* Campaign */}
             <Section title="Campaign">
