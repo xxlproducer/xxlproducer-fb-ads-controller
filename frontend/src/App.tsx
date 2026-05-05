@@ -1,9 +1,10 @@
 import { Navigate, Route, Routes } from "react-router-dom";
-import { LayoutDashboard, Layers, Rocket } from "lucide-react";
 import { useAuth } from "@/lib/auth";
 import { Login } from "@/pages/Login";
 import { Tokens } from "@/pages/Tokens";
-import { Placeholder } from "@/pages/Placeholder";
+import { Dashboard } from "@/pages/Dashboard";
+import { BulkActions } from "@/pages/BulkActions";
+import { Autozaliv } from "@/pages/Autozaliv";
 
 function FullScreenLoader() {
   return (
@@ -28,40 +29,10 @@ export default function App() {
 
   return (
     <Routes>
-      <Route
-        path="/"
-        element={
-          <Placeholder
-            title="Dashboard"
-            description="Aggregated stats across all your ad accounts"
-            icon={LayoutDashboard}
-            body="Will show impressions, clicks, spend, results, purchases — across all connected tokens. Coming next."
-          />
-        }
-      />
+      <Route path="/" element={<Dashboard />} />
       <Route path="/tokens" element={<Tokens />} />
-      <Route
-        path="/bulk"
-        element={
-          <Placeholder
-            title="Bulk Actions"
-            description="Pause / activate / delete campaigns, adsets and ads in bulk"
-            icon={Layers}
-            body="Pick campaigns/adsets/ads from the grid and apply actions across many ad accounts at once."
-          />
-        }
-      />
-      <Route
-        path="/launch"
-        element={
-          <Placeholder
-            title="Autozaliv"
-            description="Launch Sales / Purchase campaigns across multiple ad accounts"
-            icon={Rocket}
-            body="3-step wizard: pick template → pick accounts → upload creatives. Currently in design — UI lands next."
-          />
-        }
-      />
+      <Route path="/bulk" element={<BulkActions />} />
+      <Route path="/launch" element={<Autozaliv />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );

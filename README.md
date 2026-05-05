@@ -4,9 +4,10 @@ A local, single-user web app for managing your Facebook ad accounts —
 inspired by tools like OptiBOX, but trimmed down to the essentials and
 built to run entirely on your own PC. Nothing leaves your machine.
 
-> Status: **MVP scaffold (Week 1).** Token management is functional;
-> Dashboard / Bulk actions / Autozaliv are placeholders that ship in the
-> next iterations.
+> Status: **Weeks 1-4 complete.** Token management, Dashboard with
+> metrics, Bulk actions (pause/activate/delete), and Autozaliv
+> (template-based campaign + adset launch across many accounts) all
+> functional.
 
 ## What's inside
 
@@ -17,49 +18,51 @@ built to run entirely on your own PC. Nothing leaves your machine.
 | Auth     | Server-side session cookies (single-user)             |
 | Storage  | One SQLite file in `backend/data/`                    |
 
-## Features (current iteration)
+## Features
 
 - **First-run setup** — creates a local admin account on first launch
 - **Login / logout** with session cookies
 - **Connect FB tokens** with live validation against the Graph API
-  (`/me`, `/me/permissions`)
-- **Per-token proxy** support for routing Graph API calls through
-  HTTP/HTTPS/SOCKS proxies
+- **Per-token proxy** support (HTTP/HTTPS/SOCKS)
 - **Aggregated ad-account view** across all connected tokens
-  (currency, timezone, balance, spent)
-- **Re-sync** any token on demand (refresh status + scopes + accounts)
-- **Apple-style UI** — clean light/dark theme, generous spacing,
-  glass-blur surfaces
+- **Dashboard** with metrics across all accounts (impressions, clicks,
+  spend, purchases, ROAS) — date presets, group-by levels
+- **Bulk actions** — pause / activate / delete campaigns, adsets, ads
+  across many accounts at once with concurrency-safe rate limiting
+- **Autozaliv wizard** — template-based Campaign + AdSet launch
+  across many accounts (with mandatory DSA fields for EU targeting)
 
 ## What's coming next
 
-- **Dashboard** with metrics across all accounts (impressions, clicks,
-  spend, results, purchases) using ag-Grid
-- **Bulk actions** — pause / activate / delete campaigns, adsets, ads
-  across many accounts at once
-- **Autozaliv** — multi-step wizard to launch Sales / Purchase
-  campaigns with creative upload and multi-account multiplication
+- **Week 5: Ad creatives** — image/video upload + Ad creation
+  attached to existing AdSets across many accounts
 
-## Quick start (Windows)
+## Quick start (Windows) — one-click launcher
 
 Requirements: **Python 3.10+** and **Node.js 18+** on `PATH`.
 
-1. Clone or download this repo.
-2. Double-click **`setup.bat`** once. It will:
-   - create a Python virtual environment in `backend/.venv`
-   - install backend dependencies
-   - install frontend dependencies
-3. Double-click **`run.bat`** to start the app. Two console windows
-   will open (backend + frontend) and your browser will navigate to
-   `http://localhost:5173`.
-4. On first launch you'll see the **first-time setup** screen — pick a
-   username and password. These are stored locally in
+1. Download the ZIP from the green **Code → Download ZIP** button on
+   GitHub, or [click here](https://github.com/xxlproducer/xxlproducer-fb-ads-controller/archive/refs/heads/main.zip).
+2. Extract anywhere (e.g. `C:\fbac`).
+3. Double-click **`START.bat`**. That's it.
+   - On first run it auto-installs everything (1-3 min).
+   - On subsequent runs it just starts the servers.
+   - Two console windows open (backend + frontend) and your browser
+     navigates to `http://localhost:5173`.
+4. On first launch pick a **username and password** — stored locally in
    `backend/data/fb_ads_controller.db`.
-5. Sign in, go to **FB Accounts**, and click **Connect token**. Paste a
+5. Sign in, go to **FB Accounts**, click **Connect token**. Paste a
    long-lived FB user access token with the scopes:
    `ads_management`, `ads_read`, `business_management`, `read_insights`.
 
 To stop the app, close both console windows.
+
+### Updating to the latest version
+
+Double-click **`UPDATE.bat`**. It downloads the latest `main.zip` from
+GitHub, copies it over (preserving your venv, node_modules, and
+database), reinstalls any new dependencies, and restarts the app. No
+git, no PowerShell, no terminal.
 
 ## Quick start (macOS / Linux)
 
@@ -92,8 +95,10 @@ fb-ads-controller/
 │  ├─ index.html
 │  ├─ tailwind.config.js
 │  └─ vite.config.ts
-├─ run.bat / run.sh    # one-click launcher
-└─ setup.bat           # first-time install
+├─ START.bat           # one-click launcher (Windows)
+├─ UPDATE.bat          # one-click update from GitHub (Windows)
+├─ setup.bat           # first-time install (Windows, called by START)
+└─ run.sh              # one-click launcher (macOS / Linux)
 ```
 
 ## Configuration
